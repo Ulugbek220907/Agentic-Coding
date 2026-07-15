@@ -1,0 +1,26 @@
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# App config (may contain API keys / model settings)
+*.ai_agent_memory.json
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
