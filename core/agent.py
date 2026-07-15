@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Generator, Optional, Callable, List
 
 from .failover import ModelRouter, AllModelsFailedError
+from .council import CouncilRouter
 from .tools import ProjectTools, AGENT_TOOLS
 
 BASE_SYSTEM_PROMPT = """You are a coding agent with direct access to a local project folder.
@@ -30,7 +31,10 @@ BASE_SYSTEM_PROMPT = """You are a coding agent with direct access to a local pro
 You can call these tools to explore and modify the project:
 - list_dir(path): see what's in a folder
 - read_file(path): read a file's contents
-- write_file(path, content): create or overwrite a file
+- write_file(path, content): create or overwrite a TEXT file (code, markdown, config, etc.)
+- generate_document(path, doc_type, title, sections): create a REAL .docx, .pdf, or
+  .xlsx file. Use this instead of write_file whenever the user asks for a Word
+  document, PDF, report, or spreadsheet -- never fake a binary format as a text file.
 - run_command(command): run a shell command in the project root (e.g. tests, installs)
 - task_complete(summary): call this ONLY when the user's request is fully done
 
@@ -43,6 +47,24 @@ Work step by step: inspect relevant files before editing them, make focused
 changes, and verify your work (e.g. by re-reading a file or running tests)
 before declaring the task complete. Always finish by calling task_complete
 with a short summary of what you changed.
+
+Output quality rules for anything you say directly to the user (not file
+contents):
+- Any code you show in chat MUST be in a fenced code block with a language
+  tag, e.g. ```python ... ``` -- this is what makes it render as a proper,
+  copyable code box instead of a wall of plain text.
+- Be concrete and specific. Prefer short, direct sentences over hedging or
+  restating the question back at the user.
+- Use markdown structure (headings, bullet lists, bold) when it genuinely
+  clarifies something with real structure (steps, comparisons, multiple
+  options) -- not for simple one-line answers, which should just be prose.
+- Don't pad responses with throat-clearing ("Great question!", "Certainly!
+  Here's...") or a restated summary of what you're about to do right before
+  you do it.
+- If the user asks for a document, report, spreadsheet, or presentation,
+  actually generate the file with generate_document/write_file rather than
+  pasting its contents into the chat -- chat text is for explanation, files
+  are for deliverables.
 """
 
 
@@ -59,7 +81,7 @@ def build_system_prompt(project_memory: Optional[List[str]] = None) -> str:
 
 
 def run_agent_task(
-    router: ModelRouter,
+    router: CouncilRouter,
     project_root: str,
     user_instruction: str,
     max_iterations: int = 25,
@@ -106,10 +128,23 @@ def run_agent_task(
             yield {"type": "error", "text": str(e)}
             return
 
-        # Flush any model_switch / model_failed events captured during this call.
+        # Flush any model_switch / model_failed / council_* events captured
+        # during this call (per-participant failover events, plus
+        # council_vote / council_disagreement / council_synthesized / etc.
+        # bridged the same way from CouncilRouter.on_event).
         for ev in pending_events:
             yield ev
         pending_events.clear()
+
+        if len(result.contributors) > 1:
+            yield {
+                "type": "council_step",
+                "contributors": result.contributors,
+                "winning_models": result.winning_models,
+                "agreement": result.agreement,
+                "synthesized": result.synthesized,
+                "failed_models": result.failed_models,
+            }
 
         response = result.response
         assistant_msg = {
@@ -120,7 +155,11 @@ def run_agent_task(
         history.append(assistant_msg)
 
         if response.get("content"):
-            yield {"type": "assistant_text", "text": response["content"], "model": result.model_used.name}
+            yield {
+                "type": "assistant_text",
+                "text": response["content"],
+                "model": ", ".join(result.winning_models),
+            }
 
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
@@ -153,6 +192,13 @@ def run_agent_task(
                     tool_output = tools.read_file(args.get("path", ""))
                 elif name == "write_file":
                     tool_output = tools.write_file(args.get("path", ""), args.get("content", ""))
+                elif name == "generate_document":
+                    tool_output = tools.generate_document(
+                        args.get("path", ""),
+                        args.get("doc_type", ""),
+                        args.get("title", ""),
+                        args.get("sections", []),
+                    )
                 elif name == "run_command":
                     tool_output = tools.run_command(args.get("command", ""))
                 else:

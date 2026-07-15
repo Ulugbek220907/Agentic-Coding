@@ -71,6 +71,92 @@ class ProjectTools:
             return f"Error writing '{path}': {e}"
         return f"Wrote {len(content)} characters to '{path}'."
 
+    def generate_document(self, path: str, doc_type: str, title: str = "", sections: Optional[list] = None) -> str:
+        """
+        Create a real .docx, .pdf, or .xlsx file -- not a text dump. `sections`
+        is a list of {"heading": str, "body": str} dicts (body can contain
+        \\n-separated paragraphs; lines starting with "- " become bullets).
+        For .xlsx, `sections` is instead a list of rows (each row a list of
+        cell values), and `title` is used as the sheet name.
+        """
+        target = self._resolve(path)
+        if not self.confirm_write(str(target), f"[generated {doc_type} document: {title}]"):
+            return f"User declined creating '{path}'."
+        sections = sections or []
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            doc_type = doc_type.lower().lstrip(".")
+
+            if doc_type == "docx":
+                from docx import Document
+                doc = Document()
+                if title:
+                    doc.add_heading(title, level=0)
+                for sec in sections:
+                    if sec.get("heading"):
+                        doc.add_heading(sec["heading"], level=1)
+                    for line in sec.get("body", "").split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("- "):
+                            doc.add_paragraph(line[2:], style="List Bullet")
+                        else:
+                            doc.add_paragraph(line)
+                doc.save(str(target))
+
+            elif doc_type == "pdf":
+                from reportlab.lib.pagesizes import letter
+                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+                from reportlab.lib.styles import getSampleStyleSheet
+
+                styles = getSampleStyleSheet()
+                story = []
+                if title:
+                    story.append(Paragraph(title, styles["Title"]))
+                    story.append(Spacer(1, 12))
+                for sec in sections:
+                    if sec.get("heading"):
+                        story.append(Paragraph(sec["heading"], styles["Heading2"]))
+                    bullets = []
+                    for line in sec.get("body", "").split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("- "):
+                            bullets.append(ListItem(Paragraph(line[2:], styles["Normal"])))
+                        else:
+                            if bullets:
+                                story.append(ListFlowable(bullets, bulletType="bullet"))
+                                bullets = []
+                            story.append(Paragraph(line, styles["Normal"]))
+                    if bullets:
+                        story.append(ListFlowable(bullets, bulletType="bullet"))
+                    story.append(Spacer(1, 10))
+                SimpleDocTemplate(str(target), pagesize=letter).build(story)
+
+            elif doc_type == "xlsx":
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = (title or "Sheet1")[:31]
+                for row in sections:
+                    ws.append(row)
+                wb.save(str(target))
+
+            else:
+                return f"Unsupported doc_type '{doc_type}'. Use 'docx', 'pdf', or 'xlsx'."
+
+        except ImportError as e:
+            return (
+                f"Missing library for '{doc_type}' generation: {e}. "
+                f"Install with: pip install python-docx reportlab openpyxl"
+            )
+        except Exception as e:
+            return f"Error generating '{path}': {e}"
+
+        return f"Created {doc_type} document at '{path}'."
+
     def run_command(self, command: str, timeout: int = 30) -> str:
         if not self.confirm_command(command):
             return f"User declined running command: {command}"
@@ -129,6 +215,27 @@ AGENT_TOOLS = [
             "type": "object",
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
+        },
+    },
+    {
+        "name": "generate_document",
+        "description": (
+            "Create a REAL .docx, .pdf, or .xlsx file (not a text file). Use this "
+            "whenever the user asks for a Word doc, PDF, report, or spreadsheet -- "
+            "never try to fake one with write_file. For docx/pdf, 'sections' is a "
+            "list of {heading, body} objects (body lines starting with '- ' become "
+            "bullet points). For xlsx, 'sections' is a list of rows, each row a "
+            "list of cell values, and the first row is typically your header."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Output path, e.g. 'reports/summary.pdf'"},
+                "doc_type": {"type": "string", "enum": ["docx", "pdf", "xlsx"]},
+                "title": {"type": "string"},
+                "sections": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["path", "doc_type"],
         },
     },
     {

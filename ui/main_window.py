@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -8,18 +9,80 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTreeView,
     QTextEdit, QTextBrowser, QLineEdit, QPushButton, QFileDialog,
-    QMessageBox, QLabel, QMenuBar, QComboBox, QSizePolicy,
+    QMessageBox, QLabel, QMenuBar, QComboBox, QSizePolicy, QApplication,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl
 from PyQt6.QtGui import QAction, QFileSystemModel
 
 from core.config import ConfigManager
 from core.failover import ModelRouter
+from core.council import CouncilRouter, CouncilMode
 from core.agent import run_agent_task
 from core.memory import load_memory, append_memory
 from ui.settings_dialog import SettingsDialog
 
 AUTO_MODEL_LABEL = "Auto (priority order)"
+
+_CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def render_markdown_lite(text: str, code_store: dict) -> str:
+    """
+    Minimal markdown -> HTML for chat bubbles: real, monospace, copyable
+    fenced code blocks (the main thing that made responses look "terrible"
+    as raw escaped text), plus bold/inline-code/bullets. Not a full markdown
+    parser -- just enough for a chat log QTextBrowser to render.
+
+    code_store: dict this function fills in as {token: raw_code_text}, so
+    the copy-link handler can retrieve the *unescaped* original text.
+    """
+    out_parts = []
+    last_end = 0
+
+    for m in _CODE_BLOCK_RE.finditer(text):
+        out_parts.append(_render_inline(text[last_end:m.start()]))
+        lang, code = m.group(1), m.group(2).rstrip("\n")
+        token = uuid.uuid4().hex[:12]
+        code_store[token] = code
+        out_parts.append(
+            f"<div style='margin:6px 0;background:#0d0d0f;border-radius:10px;"
+            f"padding:10px 12px;'>"
+            f"<div style='display:flex;justify-content:space-between;color:#9a9a9e;"
+            f"font-size:11px;font-family:Consolas,monospace;margin-bottom:4px;'>"
+            f"<span>{html.escape(lang or 'code')}</span>"
+            f"<a href='copycode://{token}' style='color:#7fb0ff;text-decoration:none;'>Copy</a>"
+            f"</div>"
+            f"<pre style='margin:0;color:#e8e8ea;font-family:Consolas,monospace;"
+            f"font-size:12px;white-space:pre-wrap;'>{html.escape(code)}</pre>"
+            f"</div>"
+        )
+        last_end = m.end()
+
+    out_parts.append(_render_inline(text[last_end:]))
+    return "".join(out_parts)
+
+
+def _render_inline(text: str) -> str:
+    """Escape then apply bold / inline-code / simple bullet-line formatting
+    to a plain (non-fenced-code) chunk of text."""
+    escaped = html.escape(text)
+    escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
+    escaped = _INLINE_CODE_RE.sub(
+        r"<code style='background:#eeeeef;border-radius:4px;padding:1px 4px;"
+        r"font-family:Consolas,monospace;'>\1</code>",
+        escaped,
+    )
+    lines = escaped.split("\n")
+    rendered = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            rendered.append(f"&nbsp;&nbsp;&bull; {stripped[2:]}")
+        else:
+            rendered.append(line)
+    return "<br>".join(rendered)
 
 IDLE_BADGE_STYLE = (
     "background-color:#f0f0f2;color:#1a1a1a;border-radius:10px;"
@@ -95,6 +158,7 @@ class MainWindow(QMainWindow):
         self.project_memory: list[str] = []
         self._last_instruction: str = ""
         self._last_assistant_text: str | None = None
+        self._code_blocks: dict[str, str] = {}
 
         self.confirm_bridge = ConfirmationBridge()
         self.confirm_bridge.request_write.connect(self._handle_confirm_write_request)
@@ -148,6 +212,27 @@ class MainWindow(QMainWindow):
         self.model_combo.setMinimumWidth(200)
         self.model_combo.setFixedHeight(30)
         header_row.addWidget(self.model_combo)
+
+        mode_label = QLabel("Mode:")
+        mode_label.setStyleSheet("color:#6b6b6f; font-weight:600; font-size:12px;")
+        header_row.addWidget(mode_label)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.setToolTip(
+            "Light: one model per step (fastest, cheapest).\n"
+            "Council (2-3): a few top models vote each step; disagreements\n"
+            "on tool calls are resolved by priority order, and only the final\n"
+            "text answer gets synthesized -- so cost stays close to N calls,\n"
+            "not N calls per step plus extra arbitration.\n"
+            "Max: same as Council but includes every enabled model. Most\n"
+            "thorough, most expensive -- use for high-stakes changes."
+        )
+        self.mode_combo.addItem("Light", CouncilMode.LIGHT)
+        self.mode_combo.addItem("Council (2-3 AIs)", CouncilMode.COUNCIL)
+        self.mode_combo.addItem("Max (all AIs)", CouncilMode.MAX)
+        self.mode_combo.setMinimumWidth(150)
+        self.mode_combo.setFixedHeight(30)
+        header_row.addWidget(self.mode_combo)
 
         # Fixed height + a capped (not expanding) size policy: this badge
         # must never grow to fill available space, regardless of DPI or
@@ -322,6 +407,15 @@ class MainWindow(QMainWindow):
         )
 
     def _on_log_anchor_clicked(self, url: QUrl):
+        if url.scheme() == "copycode":
+            token = url.host()
+            code = self._code_blocks.get(token)
+            if code is not None:
+                QApplication.clipboard().setText(code)
+                self._append_log(
+                    "<span style='color:#4a7d3a;font-size:11px;'>&#10003; Copied to clipboard</span>"
+                )
+            return
         if url.scheme() != "agentaction":
             return
         action = url.host()
@@ -377,7 +471,8 @@ class MainWindow(QMainWindow):
         self.send_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
-        router = ModelRouter(models)
+        mode = self.mode_combo.currentData() or CouncilMode.LIGHT
+        router = CouncilRouter(models, mode=mode)
 
         self.thread = QThread()
         self.worker = AgentWorker(
@@ -415,11 +510,35 @@ class MainWindow(QMainWindow):
             self._append_log(f"<span style='color:#c22b2b;'>Model failed ({html.escape(ev['model'])}): {html.escape(ev['error'])}</span>")
         elif t == "model_success":
             self._set_active_model(ev["model"])
+        elif t == "council_step":
+            names = ", ".join(ev["winning_models"])
+            if ev["synthesized"]:
+                self._append_log(
+                    f"<span style='color:#4a7d3a;font-size:12px;'>"
+                    f"&#9733; Synthesized final answer from: {html.escape(', '.join(ev['contributors']))}</span>"
+                )
+            elif ev["agreement"]:
+                self._append_log(
+                    f"<span style='color:#4a7d3a;font-size:12px;'>"
+                    f"&#10003; {len(ev['contributors'])} models consulted, agreed via {html.escape(names)}</span>"
+                )
+            else:
+                self._append_log(
+                    f"<span style='color:#b5720a;font-size:12px;'>"
+                    f"&#9888; Models disagreed on next step -- went with {html.escape(names)} "
+                    f"(highest priority)</span>"
+                )
+            if ev.get("failed_models"):
+                self._append_log(
+                    f"<span style='color:#c22b2b;font-size:11px;'>"
+                    f"({html.escape(', '.join(ev['failed_models']))} didn't respond this round)</span>"
+                )
         elif t == "assistant_text":
             self._last_assistant_text = ev["text"]
+            body = render_markdown_lite(ev["text"], self._code_blocks)
             self._append_log(
                 f"<div style='margin:8px 0;background:#f7f7f8;border-radius:12px;padding:8px 12px;'>"
-                f"<b>{html.escape(ev.get('model','Agent'))}:</b> {html.escape(ev['text'])}</div>"
+                f"<b>{html.escape(ev.get('model','Agent'))}:</b><br>{body}</div>"
             )
         elif t == "tool_call":
             self._append_log(
