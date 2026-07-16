@@ -41,6 +41,7 @@ class ModelConfig:
 @dataclass
 class AppConfig:
     project_folder: Optional[str] = None
+    recent_projects: List[str] = field(default_factory=list)  # most-recent-first, capped at 10
     models: List[ModelConfig] = field(default_factory=list)
     max_agent_iterations: int = 25
     auto_confirm_writes: bool = False   # if False, UI will ask before writing files
@@ -59,6 +60,7 @@ class ConfigManager:
             models = [ModelConfig(**m) for m in raw.get("models", [])]
             self.config = AppConfig(
                 project_folder=raw.get("project_folder"),
+                recent_projects=raw.get("recent_projects", []),
                 models=models,
                 max_agent_iterations=raw.get("max_agent_iterations", 25),
                 auto_confirm_writes=raw.get("auto_confirm_writes", False),
@@ -95,4 +97,7 @@ class ConfigManager:
 
     def set_project_folder(self, folder: str) -> None:
         self.config.project_folder = folder
+        recents = [p for p in self.config.recent_projects if p != folder]
+        recents.insert(0, folder)
+        self.config.recent_projects = recents[:10]
         self.save()

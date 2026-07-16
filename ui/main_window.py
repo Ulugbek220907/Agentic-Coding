@@ -57,6 +57,11 @@ def _condense_for_memory(text: str, max_len: int = 220) -> str:
 
 AUTO_MODEL_LABEL = "Auto (priority order)"
 
+# Holds references to windows opened via "Open project in new window" so
+# Python doesn't garbage-collect them the instant the method that created
+# them returns (nothing else would be holding a reference otherwise).
+_open_windows: list = []
+
 _CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -235,6 +240,48 @@ class AgentWorker(QObject):
         self.finished.emit()
 
 
+class TerminalWorker(QObject):
+    """
+    Runs a single shell command directly -- no model call at all. Mirrors
+    AgentWorker's signal interface (agent_event/finished/request_stop) on
+    purpose: _on_agent_event, the Stop button, and the send/input
+    enable-disable logic in MainWindow all work on either worker type
+    unmodified, since MainWindow never needs to know which one is running.
+    """
+    agent_event = pyqtSignal(dict)
+    finished = pyqtSignal()
+
+    def __init__(self, project_root, command, confirm_command, timeout=120):
+        super().__init__()
+        self.project_root = project_root
+        self.command = command
+        self.confirm_command = confirm_command
+        self.timeout = timeout
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        from core.tools import ProjectTools
+        try:
+            self.agent_event.emit({"type": "tool_call", "name": "run_command", "arguments": {"command": self.command}})
+            tools = ProjectTools(
+                self.project_root,
+                confirm_command=self.confirm_command,
+                stop_check=lambda: self._stop_requested,
+            )
+            result = tools.run_command(self.command, timeout=self.timeout)
+            self.agent_event.emit({"type": "tool_result", "result": result})
+            if self._stop_requested:
+                self.agent_event.emit({"type": "stopped", "text": "Terminal command stopped."})
+            else:
+                self.agent_event.emit({"type": "done", "summary": None})
+        except Exception as e:
+            self.agent_event.emit({"type": "error", "text": f"Unexpected error running command: {e}"})
+        self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -303,9 +350,40 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._prompt_for_project_folder)
         file_menu.addAction(open_action)
 
+        new_window_action = QAction("Open project in new window...", self)
+        new_window_action.setToolTip("Work on a different project folder in its own window, without closing this one.")
+        new_window_action.triggered.connect(self._open_project_in_new_window)
+        file_menu.addAction(new_window_action)
+
+        self.recent_menu = file_menu.addMenu("Open Recent")
+        self._refresh_recent_menu()
+
+        file_menu.addSeparator()
+
+        save_chat_action = QAction("Save chat log...", self)
+        save_chat_action.setToolTip("Export this conversation to a file. Local only -- never sent to any AI model.")
+        save_chat_action.triggered.connect(self._save_chat_log)
+        file_menu.addAction(save_chat_action)
+
+        file_menu.addSeparator()
+
         settings_action = QAction("Model settings...", self)
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
+
+    def _refresh_recent_menu(self):
+        self.recent_menu.clear()
+        recents = self.config.config.recent_projects
+        if not recents:
+            empty = self.recent_menu.addAction("(no recent projects)")
+            empty.setEnabled(False)
+            return
+        for folder in recents:
+            action = QAction(folder, self)
+            # default-arg trick so each lambda captures its own `folder`,
+            # not whatever `folder` happens to be after the loop ends
+            action.triggered.connect(lambda checked=False, f=folder: self._open_recent_project(f))
+            self.recent_menu.addAction(action)
 
     def _build_ui(self):
         container = QWidget()
@@ -442,10 +520,74 @@ class MainWindow(QMainWindow):
     # ---------- Project folder handling ----------
 
     def _prompt_for_project_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select project folder")
+        # BUGFIX: QFileDialog.getExistingDirectory() with no starting path
+        # defaults to the process's current working directory. If you launch
+        # this app with `python main.py` from inside its own source folder
+        # (very common), the dialog opens rooted at the AI Agent Desktop
+        # source tree itself -- which looks like "it keeps opening its own
+        # project" even though nothing is actually overriding your choice.
+        # Starting from the current/last project's parent (or home as a
+        # last resort) avoids that entirely.
+        start_dir = str(Path.home())
+        if getattr(self, "project_folder", None):
+            start_dir = str(Path(self.project_folder).parent)
+        folder = QFileDialog.getExistingDirectory(self, "Select project folder", start_dir)
         if folder:
             self._set_project_folder(folder)
             self.config.set_project_folder(folder)
+            self._refresh_recent_menu()
+
+    def _open_project_in_new_window(self):
+        # Keep a reference in _open_windows -- otherwise Python garbage
+        # collects the QMainWindow the instant this method returns (nothing
+        # else holds it), and the new window would flash and disappear.
+        start_dir = str(Path(self.project_folder).parent) if getattr(self, "project_folder", None) else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select project folder for new window", start_dir)
+        if not folder:
+            return
+        new_window = MainWindow()
+        new_window._set_project_folder(folder)
+        new_window.config.set_project_folder(folder)
+        new_window._refresh_recent_menu()
+        new_window.show()
+        _open_windows.append(new_window)
+        self._refresh_recent_menu()
+
+    def _open_recent_project(self, folder: str):
+        if not Path(folder).is_dir():
+            QMessageBox.warning(self, "Folder not found", f"'{folder}' no longer exists on disk.")
+            self.config.config.recent_projects = [p for p in self.config.config.recent_projects if p != folder]
+            self.config.save()
+            self._refresh_recent_menu()
+            return
+        self._set_project_folder(folder)
+        self.config.set_project_folder(folder)
+        self._refresh_recent_menu()
+
+    def _save_chat_log(self):
+        """
+        Export the chat transcript to a file. This is purely local -- it's
+        never sent to any AI model, just a copy for the user's own records.
+        """
+        if not getattr(self, "project_folder", None):
+            default_name = "chat_log.html"
+        else:
+            default_name = str(Path(self.project_folder) / "chat_log.html")
+        path, chosen_filter = QFileDialog.getSaveFileName(
+            self, "Save chat log", default_name,
+            "HTML (preserves formatting) (*.html);;Plain text (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".txt"):
+                Path(path).write_text(self.log.toPlainText(), encoding="utf-8")
+            else:
+                Path(path).write_text(self.log.toHtml(), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"Could not save chat log:\n{e}")
+            return
+        QMessageBox.information(self, "Saved", f"Chat log saved to:\n{path}")
 
     def _set_project_folder(self, folder: str):
         self.project_folder = folder
@@ -651,6 +793,17 @@ class MainWindow(QMainWindow):
             self._prompt_for_project_folder()
             return
 
+        # "/terminal <command>" runs the command directly against the
+        # project folder with NO model call at all -- for when you just
+        # want to run `npm install` or `pytest` without spending a request
+        # (or waiting on one) to have the AI decide to call run_command.
+        if instruction.lower().startswith("/terminal "):
+            command = instruction[len("/terminal "):].strip()
+            if not command:
+                return
+            self._run_terminal_command(command)
+            return
+
         models = self.config.sorted_models()
         if not models:
             QMessageBox.warning(self, "No models configured", "Add at least one model in Model settings.")
@@ -676,20 +829,45 @@ class MainWindow(QMainWindow):
             bg=self._colors.user_bubble_bg, text_color=self._colors.user_bubble_text,
             copy_token=token,
         ))
-        self.send_btn.setEnabled(False)
-        self.input_box.setEnabled(False)
-        self.stop_btn.setEnabled(True)
 
         mode = self.mode_combo.currentData() or CouncilMode.LIGHT
         router = CouncilRouter(models, mode=mode)
 
-        self.thread = QThread()
-        self.worker = AgentWorker(
+        worker = AgentWorker(
             router, self.project_folder, instruction,
             self.config.config.max_agent_iterations,
             self._confirm_write, self._confirm_command,
             self.project_memory,
         )
+        self._start_worker(worker)
+
+    def _run_terminal_command(self, command: str):
+        self._last_instruction = f"/terminal {command}"
+        self._last_assistant_text = None
+        self.input_box.clear()
+
+        token = uuid.uuid4().hex[:12]
+        self._code_blocks[token] = command
+        self._append_log(_message_bubble(
+            "You (terminal)", html.escape(command), self._colors,
+            bg=self._colors.user_bubble_bg, text_color=self._colors.user_bubble_text,
+            copy_token=token,
+        ))
+
+        worker = TerminalWorker(self.project_folder, command, self._confirm_command)
+        self._start_worker(worker)
+
+    def _start_worker(self, worker):
+        """Shared QThread wiring for AgentWorker and TerminalWorker -- both
+        expose the same agent_event/finished/request_stop interface, so
+        everything past this point (Stop button, event handling, re-enabling
+        input) works identically regardless of which one is running."""
+        self.send_btn.setEnabled(False)
+        self.input_box.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        self.thread = QThread()
+        self.worker = worker
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.agent_event.connect(self._on_agent_event)
