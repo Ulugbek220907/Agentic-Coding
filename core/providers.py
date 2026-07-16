@@ -32,9 +32,32 @@ from .config import ModelConfig
 
 class ProviderError(Exception):
     """Raised for any failure calling a model: timeout, HTTP error, bad response."""
-    def __init__(self, message: str, retryable: bool = True):
+    def __init__(self, message: str, retryable: bool = True, retry_after: float | None = None):
         super().__init__(message)
         self.retryable = retryable  # False for e.g. bad API key -- don't bother retrying
+        self.retry_after = retry_after  # seconds, if the provider told us explicitly (Retry-After header)
+
+
+def _parse_retry_after(resp) -> float | None:
+    """Parse a Retry-After header (seconds, or an HTTP-date) if present.
+    Providers that actually send this (many do on 429) let us wait exactly
+    as long as needed instead of guessing with a flat cooldown."""
+    header = resp.headers.get("Retry-After")
+    if not header:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        from datetime import datetime, timezone
+        dt = parsedate_to_datetime(header)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
 
 
 def _tools_to_openai_schema(tools: List[dict]) -> List[dict]:
@@ -111,7 +134,7 @@ def call_openai_compatible(model: ModelConfig, history: List[dict], tools: List[
     if resp.status_code == 401:
         raise ProviderError(f"{model.name}: invalid API key (401)", retryable=False)
     if resp.status_code == 429:
-        raise ProviderError(f"{model.name}: rate limited (429)", retryable=True)
+        raise ProviderError(f"{model.name}: rate limited (429)", retryable=True, retry_after=_parse_retry_after(resp))
     if resp.status_code >= 500:
         raise ProviderError(f"{model.name}: server error ({resp.status_code})", retryable=True)
     if resp.status_code >= 400:
@@ -192,7 +215,7 @@ def call_anthropic(model: ModelConfig, history: List[dict], tools: List[dict]) -
     if resp.status_code == 401:
         raise ProviderError(f"{model.name}: invalid API key (401)", retryable=False)
     if resp.status_code == 429:
-        raise ProviderError(f"{model.name}: rate limited (429)", retryable=True)
+        raise ProviderError(f"{model.name}: rate limited (429)", retryable=True, retry_after=_parse_retry_after(resp))
     if resp.status_code >= 500:
         raise ProviderError(f"{model.name}: server error ({resp.status_code})", retryable=True)
     if resp.status_code >= 400:

@@ -10,9 +10,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTreeView,
     QTextEdit, QTextBrowser, QLineEdit, QPushButton, QFileDialog,
     QMessageBox, QLabel, QMenuBar, QComboBox, QSizePolicy, QApplication,
+    QMenu,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl
-from PyQt6.QtGui import QAction, QFileSystemModel
+from PyQt6.QtGui import QAction, QFileSystemModel, QDesktopServices
 
 from core.config import ConfigManager
 from core.failover import ModelRouter
@@ -20,6 +21,39 @@ from core.council import CouncilRouter, CouncilMode
 from core.agent import run_agent_task
 from core.memory import load_memory, append_memory
 from ui.settings_dialog import SettingsDialog
+from ui.theme import ThemeColors, build_palette, build_stylesheet
+from ui.file_editor_dialog import FileEditorDialog
+
+def _summarize_tool_args(tool_name: str, arguments: dict) -> str:
+    """
+    Compact, human-scannable summary of a tool call's arguments -- avoids
+    dumping e.g. an entire 10-section document body into the chat log as one
+    giant line. Long strings are truncated; lists/dicts are shown as counts.
+    """
+    parts = []
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            shown = value if len(value) <= 60 else value[:57] + "..."
+            parts.append(f"{key}={shown!r}")
+        elif isinstance(value, list):
+            parts.append(f"{key}=[{len(value)} item{'s' if len(value) != 1 else ''}]")
+        elif isinstance(value, dict):
+            parts.append(f"{key}={{...}}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return ", ".join(parts)
+
+
+def _condense_for_memory(text: str, max_len: int = 220) -> str:
+    """Strip fenced code blocks and collapse to a short one-liner. Memory
+    entries are meant to be cheap continuity hints ("we already built X"),
+    not a second copy of the full response."""
+    without_code = _CODE_BLOCK_RE.sub("[code omitted]", text)
+    collapsed = " ".join(without_code.split())
+    if len(collapsed) > max_len:
+        collapsed = collapsed[: max_len - 3].rstrip() + "..."
+    return collapsed
+
 
 AUTO_MODEL_LABEL = "Auto (priority order)"
 
@@ -28,7 +62,7 @@ _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
 
-def render_markdown_lite(text: str, code_store: dict) -> str:
+def render_markdown_lite(text: str, code_store: dict, colors: ThemeColors) -> str:
     """
     Minimal markdown -> HTML for chat bubbles: real, monospace, copyable
     fenced code blocks (the main thing that made responses look "terrible"
@@ -37,41 +71,53 @@ def render_markdown_lite(text: str, code_store: dict) -> str:
 
     code_store: dict this function fills in as {token: raw_code_text}, so
     the copy-link handler can retrieve the *unescaped* original text.
+
+    NOTE on layout: QTextBrowser's rich-text engine is a Qt-specific HTML/CSS
+    subset -- it does NOT support `display:flex`. A flex header with
+    justify-content:space-between just renders as an ordinary inline block,
+    which is why "Copy" wasn't actually sticking to the right before. Qt's
+    rich text engine is fundamentally table-based (that's how it lays out
+    rich documents internally), so a <table width='100%'> with two <td>s is
+    the reliable way to get one thing pinned left and another pinned right.
     """
     out_parts = []
     last_end = 0
 
     for m in _CODE_BLOCK_RE.finditer(text):
-        out_parts.append(_render_inline(text[last_end:m.start()]))
+        out_parts.append(_render_inline(text[last_end:m.start()], colors))
         lang, code = m.group(1), m.group(2).rstrip("\n")
         token = uuid.uuid4().hex[:12]
         code_store[token] = code
         out_parts.append(
-            f"<div style='margin:6px 0;background:#0d0d0f;border-radius:10px;"
-            f"padding:10px 12px;'>"
-            f"<div style='display:flex;justify-content:space-between;color:#9a9a9e;"
-            f"font-size:11px;font-family:Consolas,monospace;margin-bottom:4px;'>"
-            f"<span>{html.escape(lang or 'code')}</span>"
-            f"<a href='copycode://{token}' style='color:#7fb0ff;text-decoration:none;'>Copy</a>"
-            f"</div>"
-            f"<pre style='margin:0;color:#e8e8ea;font-family:Consolas,monospace;"
+            f"<table width='100%' cellspacing='0' cellpadding='0' "
+            f"style='background:{colors.code_bg};border-radius:10px;margin:8px 0;'>"
+            f"<tr><td style='padding:10px 12px 0 12px;'>"
+            f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
+            f"<td align='left' style='color:{colors.text_dim};font-size:11px;"
+            f"font-family:Consolas,monospace;'>{html.escape(lang or 'code')}</td>"
+            f"<td align='right' style='color:{colors.link};font-size:11px;'>"
+            f"<a href='copycode://{token}' style='color:{colors.link};text-decoration:none;'>&#128203; Copy</a>"
+            f"</td></tr></table>"
+            f"</td></tr>"
+            f"<tr><td style='padding:4px 12px 10px 12px;'>"
+            f"<pre style='margin:0;color:{colors.code_text};font-family:Consolas,monospace;"
             f"font-size:12px;white-space:pre-wrap;'>{html.escape(code)}</pre>"
-            f"</div>"
+            f"</td></tr></table>"
         )
         last_end = m.end()
 
-    out_parts.append(_render_inline(text[last_end:]))
+    out_parts.append(_render_inline(text[last_end:], colors))
     return "".join(out_parts)
 
 
-def _render_inline(text: str) -> str:
+def _render_inline(text: str, colors: ThemeColors) -> str:
     """Escape then apply bold / inline-code / simple bullet-line formatting
     to a plain (non-fenced-code) chunk of text."""
     escaped = html.escape(text)
     escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
     escaped = _INLINE_CODE_RE.sub(
-        r"<code style='background:#eeeeef;border-radius:4px;padding:1px 4px;"
-        r"font-family:Consolas,monospace;'>\1</code>",
+        rf"<code style='background:{colors.inline_code_bg};border-radius:4px;padding:1px 4px;"
+        rf"font-family:Consolas,monospace;'>\1</code>",
         escaped,
     )
     lines = escaped.split("\n")
@@ -84,14 +130,58 @@ def _render_inline(text: str) -> str:
             rendered.append(line)
     return "<br>".join(rendered)
 
-IDLE_BADGE_STYLE = (
-    "background-color:#f0f0f2;color:#1a1a1a;border-radius:10px;"
-    "padding:4px 12px;font-weight:600;font-size:12px;"
-)
-ACTIVE_BADGE_STYLE = (
-    "background-color:#e6f9ed;color:#0a7a3d;border-radius:10px;"
-    "padding:4px 12px;font-weight:600;font-size:12px;"
-)
+
+def _message_bubble(
+    role_label: str,
+    body_html: str,
+    colors: ThemeColors,
+    bg: str,
+    text_color: str,
+    copy_token: str | None = None,
+) -> str:
+    """
+    Shared bubble renderer for both user questions and assistant replies.
+    Uses a table for the role-label / Copy-link header row for the same
+    reason as the code blocks above: QTextBrowser doesn't support flexbox,
+    but it does support tables, which is the reliable way to pin the Copy
+    link to the right edge of the bubble.
+
+    Generous top/bottom margin (14px) so consecutive turns don't visually
+    run into each other -- this is the main "chat looks cramped" fix.
+    """
+    copy_cell = ""
+    if copy_token:
+        copy_cell = (
+            f"<td align='right' style='color:{colors.link};font-size:11px;'>"
+            f"<a href='copycode://{copy_token}' style='color:{colors.link};text-decoration:none;'>&#128203; Copy</a>"
+            f"</td>"
+        )
+    return (
+        f"<table width='100%' cellspacing='0' cellpadding='0' "
+        f"style='background:{bg};border-radius:14px;margin:14px 0;'>"
+        f"<tr><td style='padding:10px 14px 0 14px;'>"
+        f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
+        f"<td align='left' style='color:{text_color};font-weight:600;font-size:12px;'>{html.escape(role_label)}</td>"
+        f"{copy_cell}"
+        f"</tr></table>"
+        f"</td></tr>"
+        f"<tr><td style='padding:2px 14px 12px 14px;color:{text_color};font-size:13px;'>"
+        f"{body_html}"
+        f"</td></tr></table>"
+    )
+
+def idle_badge_style(colors: ThemeColors) -> str:
+    return (
+        f"background-color:{colors.hover_bg};color:{colors.text};border-radius:10px;"
+        f"padding:4px 12px;font-weight:600;font-size:12px;"
+    )
+
+
+def active_badge_style(colors: ThemeColors) -> str:
+    return (
+        f"background-color:{colors.hover_bg};color:{colors.success};border-radius:10px;"
+        f"padding:4px 12px;font-weight:600;font-size:12px;"
+    )
 
 
 class ConfirmationBridge(QObject):
@@ -159,6 +249,8 @@ class MainWindow(QMainWindow):
         self._last_instruction: str = ""
         self._last_assistant_text: str | None = None
         self._code_blocks: dict[str, str] = {}
+        self._dark = False
+        self._colors = ThemeColors(dark=False)
 
         self.confirm_bridge = ConfirmationBridge()
         self.confirm_bridge.request_write.connect(self._handle_confirm_write_request)
@@ -172,6 +264,34 @@ class MainWindow(QMainWindow):
             self._set_project_folder(self.config.config.project_folder)
         else:
             self._prompt_for_project_folder()
+
+    # ---------- Theme ----------
+
+    def _toggle_theme(self):
+        self._dark = not self._dark
+        self._colors = ThemeColors(dark=self._dark)
+
+        app = QApplication.instance()
+        app.setPalette(build_palette(dark=self._dark))
+        app.setStyleSheet(build_stylesheet(dark=self._dark))
+
+        self.theme_btn.setText("\u2600 Light" if self._dark else "\u263D Dark")
+        self.status_badge.setStyleSheet(
+            active_badge_style(self._colors) if self.status_badge.text().startswith("Active")
+            else idle_badge_style(self._colors)
+        )
+        dim = self._colors.text_dim
+        self.project_label.setStyleSheet(f"color: {dim}; font-weight: 500; font-size: 12px;")
+        for lbl in (self._model_label, self._mode_label):
+            lbl.setStyleSheet(f"color:{dim}; font-weight:600; font-size:12px;")
+
+        # NOTE: this recolors the app chrome and all NEW chat messages, but
+        # deliberately does not retroactively repaint already-posted bubbles
+        # in the log (that would mean keeping a full parallel copy of every
+        # message's raw markdown just to re-render it, for a purely
+        # cosmetic switch). If you toggle mid-conversation, older messages
+        # keep the color scheme they were written in; new ones use the
+        # new theme.
 
     # ---------- UI construction ----------
 
@@ -203,6 +323,7 @@ class MainWindow(QMainWindow):
         model_label = QLabel("Model:")
         model_label.setStyleSheet("color:#6b6b6f; font-weight:600; font-size:12px;")
         header_row.addWidget(model_label)
+        self._model_label = model_label
 
         self.model_combo = QComboBox()
         self.model_combo.setToolTip(
@@ -216,6 +337,7 @@ class MainWindow(QMainWindow):
         mode_label = QLabel("Mode:")
         mode_label.setStyleSheet("color:#6b6b6f; font-weight:600; font-size:12px;")
         header_row.addWidget(mode_label)
+        self._mode_label = mode_label
 
         self.mode_combo = QComboBox()
         self.mode_combo.setToolTip(
@@ -238,10 +360,17 @@ class MainWindow(QMainWindow):
         # must never grow to fill available space, regardless of DPI or
         # style quirks.
         self.status_badge = QLabel("No model used yet")
-        self.status_badge.setStyleSheet(IDLE_BADGE_STYLE)
+        self.status_badge.setStyleSheet(idle_badge_style(self._colors))
         self.status_badge.setFixedHeight(28)
         self.status_badge.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         header_row.addWidget(self.status_badge)
+
+        self.theme_btn = QPushButton("\u263D Dark")
+        self.theme_btn.setObjectName("SecondaryButton")
+        self.theme_btn.setFixedHeight(30)
+        self.theme_btn.setToolTip("Switch between light and black/grey dark theme.")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        header_row.addWidget(self.theme_btn)
         outer_layout.addLayout(header_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -252,6 +381,9 @@ class MainWindow(QMainWindow):
         self.tree.setModel(self.fs_model)
         for col in (1, 2, 3):
             self.tree.hideColumn(col)
+        self.tree.doubleClicked.connect(self._on_tree_double_clicked)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         splitter.addWidget(self.tree)
 
         # Right: chat/log + input
@@ -322,6 +454,66 @@ class MainWindow(QMainWindow):
         self.tree.setRootIndex(self.fs_model.index(folder))
         self.project_label.setText(f"Project: {folder}")
 
+    # ---------- File tree: open / edit ----------
+
+    def _on_tree_double_clicked(self, index):
+        path = self.fs_model.filePath(index)
+        if Path(path).is_dir():
+            return  # let the tree view's own expand/collapse behavior handle folders
+        self._open_file_editor(path)
+
+    def _open_file_editor(self, path: str):
+        p = Path(path)
+        if not p.is_file():
+            return
+        # Refuse to open obviously-binary files as text -- editing a binary
+        # as UTF-8 text and saving it back would corrupt it.
+        binary_exts = {
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+            ".pdf", ".docx", ".xlsx", ".pptx", ".zip", ".exe", ".dll",
+            ".pyc", ".so", ".ttf", ".woff", ".woff2", ".mp3", ".mp4", ".wav",
+        }
+        if p.suffix.lower() in binary_exts:
+            reply = QMessageBox.question(
+                self, "Binary file",
+                f"'{p.name}' looks like a binary file, not text. Open it with your "
+                f"system's default application instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+            return
+        dlg = FileEditorDialog(str(p), self._colors, parent=self)
+        dlg.exec()
+
+    def _on_tree_context_menu(self, pos):
+        index = self.tree.indexAt(pos)
+        if not index.isValid():
+            return
+        path = Path(self.fs_model.filePath(index))
+
+        menu = QMenu(self)
+        if path.is_dir():
+            open_folder_action = menu.addAction("Open folder in File Explorer")
+            open_folder_action.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            )
+        else:
+            open_editor_action = menu.addAction("Open in editor")
+            open_editor_action.triggered.connect(lambda: self._open_file_editor(str(path)))
+
+            open_default_action = menu.addAction("Open with default application")
+            open_default_action.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            )
+
+            reveal_action = menu.addAction("Show in File Explorer")
+            reveal_action.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+            )
+
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
     # ---------- Settings ----------
 
     def _open_settings(self):
@@ -336,10 +528,14 @@ class MainWindow(QMainWindow):
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _remember(self, summary: str | None):
-        """Distill this turn into one line of project memory (see core/memory.py)."""
+        """Distill this turn into one SHORT line of project memory (see
+        core/memory.py). Critically: this must NOT be the raw response text
+        -- storing a full code dump here defeats the entire point of the
+        memory system (it's supposed to be a cheap one-liner, not a second
+        copy of the whole answer)."""
         if not summary or not getattr(self, "project_folder", None):
             return
-        entry = f'User asked: "{self._last_instruction}" -> {summary}'
+        entry = f'User asked: "{self._last_instruction}" -> {_condense_for_memory(summary)}'
         self.project_memory = append_memory(self.project_folder, entry)
 
     def _confirm_write(self, path: str, content: str) -> bool:
@@ -375,17 +571,18 @@ class MainWindow(QMainWindow):
         preview = body_preview if len(body_preview) < max_preview else body_preview[:max_preview] + "\n... (truncated)"
         escaped_preview = html.escape(preview)
 
+        c = self._colors
         self._append_log(
-            f"<div style='margin:8px 0;padding:10px 12px;border:1px solid #e5e5e7;"
-            f"border-radius:10px;background:#fafafa;'>"
-            f"<b>{header}</b>"
+            f"<div style='margin:14px 0;padding:10px 12px;border:1px solid {c.border};"
+            f"border-radius:10px;background:{c.hover_bg};'>"
+            f"<b style='color:{c.text};'>{header}</b>"
             f"<pre style='white-space:pre-wrap;word-wrap:break-word;font-family:Consolas,monospace;"
-            f"font-size:12px;color:#333;margin:8px 0;'>{escaped_preview}</pre>"
+            f"font-size:12px;color:{c.text};margin:8px 0;'>{escaped_preview}</pre>"
             f"<a href='agentaction://accept/{token}' "
-            f"style='background:#0a0a0a;color:#ffffff;padding:5px 14px;border-radius:12px;"
+            f"style='background:{c.accent_bg};color:{c.accent_text};padding:5px 14px;border-radius:12px;"
             f"text-decoration:none;font-weight:600;margin-right:8px;'>Accept</a>"
             f"<a href='agentaction://decline/{token}' "
-            f"style='background:#ffffff;color:#c22b2b;border:1px solid #f0c9c9;padding:5px 14px;"
+            f"style='background:{c.panel_bg};color:{c.error};border:1px solid {c.error};padding:5px 14px;"
             f"border-radius:12px;text-decoration:none;font-weight:600;'>Decline</a>"
             f"</div>"
         )
@@ -413,7 +610,7 @@ class MainWindow(QMainWindow):
             if code is not None:
                 QApplication.clipboard().setText(code)
                 self._append_log(
-                    "<span style='color:#4a7d3a;font-size:11px;'>&#10003; Copied to clipboard</span>"
+                    f"<span style='color:{self._colors.success};font-size:11px;'>&#10003; Copied to clipboard</span>"
                 )
             return
         if url.scheme() != "agentaction":
@@ -429,9 +626,17 @@ class MainWindow(QMainWindow):
         pending["result"]["ok"] = ok
         pending["event"].set()
         self._pending_confirmation = None
-        self._append_log(f"<i style='color:#6b6b6f;'>You {'accepted' if ok else 'declined'} the request above.</i>")
+        self._append_log(f"<i style='color:{self._colors.text_dim};'>You {'accepted' if ok else 'declined'} the request above.</i>")
 
     def _on_send(self):
+        if self.thread is not None and self.thread.isRunning():
+            # A task is already in flight -- ignore duplicate Send/Enter
+            # presses instead of spinning up a second overlapping worker
+            # thread (which was happening before: input_box stayed enabled
+            # during a run, so hitting Enter again mid-task silently
+            # started a second AgentWorker racing the first one).
+            return
+
         instruction = self.input_box.text().strip()
         if not instruction:
             return
@@ -463,12 +668,16 @@ class MainWindow(QMainWindow):
         self._last_instruction = instruction
         self._last_assistant_text = None
         self.input_box.clear()
-        self._append_log(
-            f"<div style='margin:8px 0;'>"
-            f"<span style='background:#0a0a0a;color:#ffffff;border-radius:12px;padding:6px 12px;'>{html.escape(instruction)}</span>"
-            f"</div>"
-        )
+
+        token = uuid.uuid4().hex[:12]
+        self._code_blocks[token] = instruction
+        self._append_log(_message_bubble(
+            "You", html.escape(instruction), self._colors,
+            bg=self._colors.user_bubble_bg, text_color=self._colors.user_bubble_text,
+            copy_token=token,
+        ))
         self.send_btn.setEnabled(False)
+        self.input_box.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
         mode = self.mode_combo.currentData() or CouncilMode.LIGHT
@@ -497,68 +706,78 @@ class MainWindow(QMainWindow):
             self._pending_confirmation["result"]["ok"] = False
             self._pending_confirmation["event"].set()
             self._pending_confirmation = None
-            self._append_log("<i style='color:#6b6b6f;'>(auto-declined because you hit Stop)</i>")
+            self._append_log(f"<i style='color:{self._colors.text_dim};'>(auto-declined because you hit Stop)</i>")
         self.stop_btn.setEnabled(False)
 
     def _on_agent_event(self, ev: dict):
         t = ev["type"]
+        c = self._colors
         if t == "status":
-            self._append_log(f"<span style='color:#9a9a9e;font-size:12px;'>{html.escape(ev['text'])}</span>")
+            self._append_log(f"<span style='color:{c.text_faint};font-size:12px;'>{html.escape(ev['text'])}</span>")
         elif t == "model_switch":
-            self._append_log(f"<span style='color:#b5720a;'>&#8635; Switching to backup model: {html.escape(ev['model'])}</span>")
+            self._append_log(f"<span style='color:{c.warning};'>&#8635; Switching to backup model: {html.escape(ev['model'])}</span>")
         elif t == "model_failed":
-            self._append_log(f"<span style='color:#c22b2b;'>Model failed ({html.escape(ev['model'])}): {html.escape(ev['error'])}</span>")
+            self._append_log(f"<span style='color:{c.error};'>Model failed ({html.escape(ev['model'])}): {html.escape(ev['error'])}</span>")
+        elif t == "model_self_throttled":
+            self._append_log(
+                f"<span style='color:{c.text_faint};font-size:12px;'>"
+                f"&#9203; Skipping {html.escape(ev['model'])}: self-imposed rate limit "
+                f"(set in Model settings) -- would need to wait ~{ev['wait_seconds']:.0f}s</span>"
+            )
         elif t == "model_success":
             self._set_active_model(ev["model"])
         elif t == "council_step":
             names = ", ".join(ev["winning_models"])
             if ev["synthesized"]:
                 self._append_log(
-                    f"<span style='color:#4a7d3a;font-size:12px;'>"
+                    f"<span style='color:{c.success};font-size:12px;'>"
                     f"&#9733; Synthesized final answer from: {html.escape(', '.join(ev['contributors']))}</span>"
                 )
             elif ev["agreement"]:
                 self._append_log(
-                    f"<span style='color:#4a7d3a;font-size:12px;'>"
+                    f"<span style='color:{c.success};font-size:12px;'>"
                     f"&#10003; {len(ev['contributors'])} models consulted, agreed via {html.escape(names)}</span>"
                 )
             else:
                 self._append_log(
-                    f"<span style='color:#b5720a;font-size:12px;'>"
+                    f"<span style='color:{c.warning};font-size:12px;'>"
                     f"&#9888; Models disagreed on next step -- went with {html.escape(names)} "
                     f"(highest priority)</span>"
                 )
             if ev.get("failed_models"):
                 self._append_log(
-                    f"<span style='color:#c22b2b;font-size:11px;'>"
+                    f"<span style='color:{c.error};font-size:11px;'>"
                     f"({html.escape(', '.join(ev['failed_models']))} didn't respond this round)</span>"
                 )
         elif t == "assistant_text":
             self._last_assistant_text = ev["text"]
-            body = render_markdown_lite(ev["text"], self._code_blocks)
-            self._append_log(
-                f"<div style='margin:8px 0;background:#f7f7f8;border-radius:12px;padding:8px 12px;'>"
-                f"<b>{html.escape(ev.get('model','Agent'))}:</b><br>{body}</div>"
-            )
+            body = render_markdown_lite(ev["text"], self._code_blocks, c)
+            token = uuid.uuid4().hex[:12]
+            self._code_blocks[token] = ev["text"]
+            self._append_log(_message_bubble(
+                ev.get("model", "Agent"), body, c,
+                bg=c.assistant_bubble_bg, text_color=c.text,
+                copy_token=token,
+            ))
         elif t == "tool_call":
             self._append_log(
-                f"<span style='color:#6b6b6f;font-family:Consolas,monospace;font-size:12px;'>"
-                f"&rarr; {html.escape(ev['name'])}({html.escape(str(ev['arguments']))})</span>"
+                f"<span style='color:{c.text_dim};font-family:Consolas,monospace;font-size:12px;'>"
+                f"&rarr; {html.escape(ev['name'])}({html.escape(_summarize_tool_args(ev['name'], ev['arguments']))})</span>"
             )
         elif t == "tool_result":
             result_preview = str(ev["result"])[:500]
             self._append_log(
-                f"<span style='color:#9a9a9e;font-family:Consolas,monospace;font-size:12px;'>"
+                f"<span style='color:{c.text_faint};font-family:Consolas,monospace;font-size:12px;'>"
                 f"&nbsp;&nbsp;{html.escape(result_preview)}</span>"
             )
         elif t == "stopped":
-            self._append_log(f"<b style='color:#b5720a;'>Stopped:</b> {html.escape(ev['text'])}")
+            self._append_log(f"<b style='color:{c.warning};'>Stopped:</b> {html.escape(ev['text'])}")
             self._remember("(user stopped this task before it finished)")
         elif t == "done":
             summary = ev.get("summary")
             if summary:
                 # A real task_complete summary -- show it and remember it.
-                self._append_log(f"<b style='color:#0a7a3d;'>Done:</b> {html.escape(summary)}")
+                self._append_log(f"<b style='color:{c.success};'>Done:</b> {html.escape(summary)}")
                 self._remember(summary)
             else:
                 # Plain conversational reply -- its text was already shown
@@ -566,15 +785,17 @@ class MainWindow(QMainWindow):
                 # Still worth a one-line memory entry for continuity.
                 self._remember(self._last_assistant_text)
         elif t == "error":
-            self._append_log(f"<b style='color:#c22b2b;'>Error:</b> {html.escape(ev['text'])}")
+            self._append_log(f"<b style='color:{c.error};'>Error:</b> {html.escape(ev['text'])}")
             self._remember(f"(task did not complete: {ev['text'][:200]})")
 
     def _set_active_model(self, model_name: str):
         self.status_badge.setText(f"Active model: {model_name}")
-        self.status_badge.setStyleSheet(ACTIVE_BADGE_STYLE)
+        self.status_badge.setStyleSheet(active_badge_style(self._colors))
 
     def _on_agent_finished(self):
         self.send_btn.setEnabled(True)
+        self.input_box.setEnabled(True)
+        self.input_box.setFocus()
         self.stop_btn.setEnabled(False)
         if self.thread:
             self.thread.quit()

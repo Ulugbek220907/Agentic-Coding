@@ -10,21 +10,73 @@ from pathlib import Path
 from typing import Optional
 
 
+_UNICODE_FONT_NAME = None  # cached after first successful registration
+
+
+def _register_unicode_font() -> str:
+    """
+    Register a font with full Cyrillic (and general Unicode) coverage for
+    ReportLab, and return its registered name. ReportLab's built-in base14
+    fonts (Helvetica, Times-Roman, etc.) have NO Cyrillic glyphs at all --
+    that's why Russian/etc. text rendered as black boxes before. We ship
+    DejaVu Sans with the app specifically so this works regardless of what
+    fonts happen to be installed on the user's machine.
+    """
+    global _UNICODE_FONT_NAME
+    if _UNICODE_FONT_NAME:
+        return _UNICODE_FONT_NAME
+
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    bundled_regular = Path(__file__).parent.parent / "assets" / "fonts" / "DejaVuSans.ttf"
+    bundled_bold = Path(__file__).parent.parent / "assets" / "fonts" / "DejaVuSans-Bold.ttf"
+
+    candidates = [
+        ("UnicodeFont", bundled_regular, "UnicodeFont-Bold", bundled_bold),
+        # OS fallbacks, in case the bundled files are ever missing/removed
+        ("UnicodeFont", Path(r"C:\Windows\Fonts\arial.ttf"), "UnicodeFont-Bold", Path(r"C:\Windows\Fonts\arialbd.ttf")),
+        ("UnicodeFont", Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+         "UnicodeFont-Bold", Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
+        ("UnicodeFont", Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+         "UnicodeFont-Bold", Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf")),
+    ]
+
+    for reg_name, reg_path, bold_name, bold_path in candidates:
+        if reg_path.exists():
+            pdfmetrics.registerFont(TTFont(reg_name, str(reg_path)))
+            if bold_path.exists():
+                pdfmetrics.registerFont(TTFont(bold_name, str(bold_path)))
+                pdfmetrics.registerFontFamily(reg_name, normal=reg_name, bold=bold_name)
+            _UNICODE_FONT_NAME = reg_name
+            return reg_name
+
+    # Nothing found -- fall back to Helvetica. Non-Latin text will render as
+    # boxes, but we don't want to hard-crash document generation over it.
+    _UNICODE_FONT_NAME = "Helvetica"
+    return _UNICODE_FONT_NAME
+
+
 class ToolError(Exception):
     pass
 
 
 class ProjectTools:
-    def __init__(self, project_root: str, confirm_write=None, confirm_command=None):
+    def __init__(self, project_root: str, confirm_write=None, confirm_command=None, stop_check=None):
         """
         confirm_write: optional callable(path, new_content) -> bool, asks the
                        user before writing a file (wire this to a UI dialog).
         confirm_command: optional callable(command) -> bool, asks the user
                           before running a shell command.
+        stop_check: optional callable() -> bool, polled while a shell command
+                    is running so the Stop button can actually kill a
+                    long-running process instead of only taking effect after
+                    it finishes on its own.
         """
         self.root = Path(project_root).resolve()
         self.confirm_write = confirm_write or (lambda *a: True)
         self.confirm_command = confirm_command or (lambda *a: True)
+        self.stop_check = stop_check or (lambda: False)
 
     def _resolve(self, rel_path: str) -> Path:
         p = (self.root / rel_path).resolve()
@@ -110,7 +162,15 @@ class ProjectTools:
                 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
                 from reportlab.lib.styles import getSampleStyleSheet
 
+                font_name = _register_unicode_font()
+                bold_font = f"{font_name}-Bold" if font_name != "Helvetica" else "Helvetica-Bold"
+
                 styles = getSampleStyleSheet()
+                for style_name in ("Title", "Heading2", "Normal"):
+                    styles[style_name].fontName = (
+                        bold_font if style_name in ("Title", "Heading2") else font_name
+                    )
+
                 story = []
                 if title:
                     story.append(Paragraph(title, styles["Title"]))
@@ -157,22 +217,80 @@ class ProjectTools:
 
         return f"Created {doc_type} document at '{path}'."
 
+    def _kill_process_tree(self, proc: "subprocess.Popen"):
+        import sys, signal, os
+        if sys.platform == "win32":
+            # shell=True spawns cmd.exe as a wrapper around the real command;
+            # proc.kill() only kills cmd.exe and can leave the actual child
+            # (npm, python, etc.) running as an orphan. taskkill /T kills the
+            # whole tree.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+            )
+        else:
+            # Same orphan problem on POSIX: shell=True spawns /bin/sh -c
+            # "<command>", and killing that shell process alone can leave the
+            # actual child (e.g. a "sleep"/"npm"/test runner) running,
+            # holding the stdout/stderr pipes open so any subsequent
+            # communicate() call hangs until that orphan exits on its own.
+            # We start the process in its own process group (see Popen call
+            # below) specifically so we can kill the whole group here.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                proc.kill()
+
     def run_command(self, command: str, timeout: int = 30) -> str:
         if not self.confirm_command(command):
             return f"User declined running command: {command}"
+
+        import time as _time
+        import sys as _sys
+
+        popen_kwargs = {}
+        if _sys.platform != "win32":
+            import os as _os
+            popen_kwargs["preexec_fn"] = _os.setsid  # own process group, for _kill_process_tree
+
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command, shell=True, cwd=self.root,
-                capture_output=True, text=True, timeout=timeout,
-                encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                **popen_kwargs,
             )
-            out = result.stdout[-4000:]
-            err = result.stderr[-2000:]
-            return f"exit_code={result.returncode}\nstdout:\n{out}\nstderr:\n{err}"
-        except subprocess.TimeoutExpired:
-            return f"Command timed out after {timeout}s: {command}"
         except Exception as e:
-            return f"Error running command '{command}': {e}"
+            return f"Error starting command '{command}': {e}"
+
+        start = _time.time()
+        poll_interval = 0.2
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=poll_interval)
+                out = stdout[-4000:] if stdout else ""
+                err = stderr[-2000:] if stderr else ""
+                return f"exit_code={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}"
+            except subprocess.TimeoutExpired:
+                pass
+
+            if self.stop_check():
+                self._kill_process_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                return f"Command stopped by user after {_time.time() - start:.1f}s: {command}"
+
+            if _time.time() - start > timeout:
+                self._kill_process_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                return f"Command timed out after {timeout}s: {command}"
 
 
 # Tool schemas exposed to the model (JSON Schema, OpenAI-function-call style;

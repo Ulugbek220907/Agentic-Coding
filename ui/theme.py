@@ -1,16 +1,14 @@
 """
-Clean white theme, loosely modeled on ElevenLabs' UI: lots of white space,
-near-black text, pill-shaped buttons, soft gray borders, a black primary
-action button instead of a "blue software" accent.
+Theme system: light (ElevenLabs-style white) and dark (black/grey).
 
 IMPORTANT -- why there's a QPalette here, not just a stylesheet:
 Some Qt widgets (combobox dropdown popups, checkboxes, tooltips, the
 native Windows menu/list highlight) pull their colors from the OS-level
 QPalette for parts a stylesheet doesn't fully override. If Windows is in
-Dark Mode, that palette defaults to light text -- which is invisible
-against the white backgrounds this stylesheet paints everywhere else.
-build_light_palette() pins every palette role to a light-theme color so
-the app looks the same regardless of the OS theme. Pair it with
+Dark Mode while this app is in Light theme (or vice versa), that palette
+can default to the wrong contrast -- invisible white-on-white or
+black-on-black text. build_palette() pins every palette role explicitly
+so the app looks the same regardless of the OS theme. Pair it with
 app.setStyle("Fusion") in main.py -- Fusion is the one built-in Qt style
 that reliably respects a custom QPalette across all widgets, including
 combobox popups (the native Windows style sometimes ignores palette
@@ -28,55 +26,120 @@ from PyQt6.QtGui import QPalette, QColor
 FONT_FAMILIES = '"Google Sans", "Segoe UI", "SF Pro Display", "Helvetica Neue", Arial, sans-serif'
 
 
-def build_light_palette() -> QPalette:
+class ThemeColors:
+    """Color tokens used both by the QSS stylesheet below AND by the chat
+    bubble HTML that main_window.py builds at runtime (message backgrounds,
+    code block colors, etc.) -- keeping them in one place means the chat
+    log actually matches the rest of the app instead of staying hardcoded
+    to light-mode colors forever."""
+
+    def __init__(self, dark: bool):
+        self.dark = dark
+        if dark:
+            self.window_bg = "#121214"
+            self.panel_bg = "#1a1a1d"
+            self.border = "#2c2c30"
+            self.text = "#e8e8ea"
+            self.text_dim = "#9a9a9e"
+            self.text_faint = "#6b6b6f"
+            self.accent_bg = "#e8e8ea"
+            self.accent_text = "#121214"
+            self.accent_hover = "#cfcfd2"
+            self.disabled_bg = "#2c2c30"
+            self.disabled_text = "#5a5a5e"
+            self.hover_bg = "#232326"
+            self.user_bubble_bg = "#2c2c30"
+            self.user_bubble_text = "#ffffff"
+            self.assistant_bubble_bg = "#1e1e21"
+            self.code_bg = "#0a0a0b"
+            self.code_text = "#e8e8ea"
+            self.inline_code_bg = "#2c2c30"
+            self.success = "#5fd07a"
+            self.warning = "#e0a446"
+            self.error = "#e0605f"
+            self.link = "#7fb0ff"
+        else:
+            self.window_bg = "#ffffff"
+            self.panel_bg = "#ffffff"
+            self.border = "#e5e5e7"
+            self.text = "#0a0a0a"
+            self.text_dim = "#6b6b6f"
+            self.text_faint = "#9a9a9e"
+            self.accent_bg = "#0a0a0a"
+            self.accent_text = "#ffffff"
+            self.accent_hover = "#262626"
+            self.disabled_bg = "#d8d8db"
+            self.disabled_text = "#9a9a9e"
+            self.hover_bg = "#f5f5f6"
+            self.user_bubble_bg = "#0a0a0a"
+            self.user_bubble_text = "#ffffff"
+            self.assistant_bubble_bg = "#f7f7f8"
+            self.code_bg = "#0d0d0f"
+            self.code_text = "#e8e8ea"
+            self.inline_code_bg = "#eeeeef"
+            self.success = "#0a7a3d"
+            self.warning = "#b5720a"
+            self.error = "#c22b2b"
+            self.link = "#2a5db0"
+
+
+def build_palette(dark: bool = False) -> QPalette:
+    c = ThemeColors(dark)
     palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor("#0a0a0a"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f7f8"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#0a0a0a"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#0a0a0a"))
-    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#0a0a0a"))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor("#c22b2b"))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor("#0a0a0a"))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#9a9a9e"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#b5b5b9"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#b5b5b9"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#b5b5b9"))
+    palette.setColor(QPalette.ColorRole.Window, QColor(c.window_bg))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(c.text))
+    palette.setColor(QPalette.ColorRole.Base, QColor(c.panel_bg))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(c.hover_bg))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(c.panel_bg))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(c.text))
+    palette.setColor(QPalette.ColorRole.Text, QColor(c.text))
+    palette.setColor(QPalette.ColorRole.Button, QColor(c.panel_bg))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(c.text))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor(c.error))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(c.accent_bg))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(c.accent_text))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(c.text_faint))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(c.disabled_text))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(c.disabled_text))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(c.disabled_text))
     return palette
 
 
-STYLESHEET = f"""
+# Kept for backwards compatibility with any existing call sites.
+def build_light_palette() -> QPalette:
+    return build_palette(dark=False)
+
+
+def build_stylesheet(dark: bool = False) -> str:
+    c = ThemeColors(dark)
+    return f"""
 * {{
     font-family: {FONT_FAMILIES};
 }}
 
 QMainWindow, QDialog {{
-    background-color: #ffffff;
+    background-color: {c.window_bg};
 }}
 
 QLabel {{
-    color: #0a0a0a;
+    color: {c.text};
     font-size: 13px;
 }}
 
 QLabel#HeaderTitle {{
     font-size: 18px;
     font-weight: 700;
-    color: #0a0a0a;
+    color: {c.text};
 }}
 
 QTreeView, QTableWidget, QListWidget {{
-    background-color: #ffffff;
-    border: 1px solid #e5e5e7;
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 10px;
-    color: #0a0a0a;
-    selection-background-color: #f0f0f2;
-    selection-color: #0a0a0a;
-    gridline-color: #eeeeee;
+    color: {c.text};
+    selection-background-color: {c.hover_bg};
+    selection-color: {c.text};
+    gridline-color: {c.border};
 }}
 
 QListWidget::item {{
@@ -85,45 +148,45 @@ QListWidget::item {{
 }}
 
 QListWidget::item:selected {{
-    background-color: #f0f0f2;
-    color: #0a0a0a;
+    background-color: {c.hover_bg};
+    color: {c.text};
 }}
 
 QHeaderView::section {{
-    background-color: #fafafa;
-    color: #6b6b6f;
+    background-color: {c.hover_bg};
+    color: {c.text_dim};
     border: none;
-    border-bottom: 1px solid #e5e5e7;
+    border-bottom: 1px solid {c.border};
     padding: 6px;
     font-weight: 600;
     font-size: 12px;
 }}
 
-QTextEdit {{
-    background-color: #ffffff;
-    border: 1px solid #e5e5e7;
+QTextEdit, QTextBrowser {{
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 12px;
     padding: 10px;
-    color: #0a0a0a;
+    color: {c.text};
     font-size: 13px;
 }}
 
 QLineEdit {{
-    background-color: #ffffff;
-    border: 1px solid #dcdce0;
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 18px;
     padding: 8px 16px;
-    color: #0a0a0a;
+    color: {c.text};
     font-size: 13px;
 }}
 
 QLineEdit:focus {{
-    border: 1px solid #0a0a0a;
+    border: 1px solid {c.accent_bg};
 }}
 
 QPushButton {{
-    background-color: #0a0a0a;
-    color: #ffffff;
+    background-color: {c.accent_bg};
+    color: {c.accent_text};
     border: none;
     border-radius: 18px;
     padding: 8px 20px;
@@ -132,44 +195,44 @@ QPushButton {{
 }}
 
 QPushButton:hover {{
-    background-color: #262626;
+    background-color: {c.accent_hover};
 }}
 
 QPushButton:disabled {{
-    background-color: #d8d8db;
-    color: #9a9a9e;
+    background-color: {c.disabled_bg};
+    color: {c.disabled_text};
 }}
 
 QPushButton#SecondaryButton {{
-    background-color: #ffffff;
-    color: #0a0a0a;
-    border: 1px solid #dcdce0;
+    background-color: {c.panel_bg};
+    color: {c.text};
+    border: 1px solid {c.border};
 }}
 
 QPushButton#SecondaryButton:hover {{
-    background-color: #f5f5f6;
+    background-color: {c.hover_bg};
 }}
 
 QPushButton#DangerButton {{
-    background-color: #ffffff;
-    color: #c22b2b;
-    border: 1px solid #f0c9c9;
+    background-color: {c.panel_bg};
+    color: {c.error};
+    border: 1px solid {c.error};
 }}
 
 QPushButton#DangerButton:hover {{
-    background-color: #fdf0f0;
+    background-color: {c.hover_bg};
 }}
 
 QComboBox {{
-    background-color: #ffffff;
-    border: 1px solid #dcdce0;
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 10px;
     padding: 6px 10px;
-    color: #0a0a0a;
+    color: {c.text};
 }}
 
 QComboBox:hover {{
-    border: 1px solid #b5b5b9;
+    border: 1px solid {c.text_faint};
 }}
 
 QComboBox::drop-down {{
@@ -177,30 +240,31 @@ QComboBox::drop-down {{
     width: 24px;
 }}
 
-/* This is the actual popup list that opens when you click a combobox --
-   the part that was showing invisible white-on-white text before. Explicit
-   colors here + Fusion style + the QPalette above make it reliable. */
+/* The actual popup list that opens when you click a combobox -- the part
+   that was showing invisible white-on-white (or black-on-black) text
+   before. Explicit colors here + Fusion style + the QPalette above make
+   it reliable regardless of OS theme. */
 QComboBox QAbstractItemView {{
-    background-color: #ffffff;
-    color: #0a0a0a;
-    border: 1px solid #e5e5e7;
+    background-color: {c.panel_bg};
+    color: {c.text};
+    border: 1px solid {c.border};
     border-radius: 8px;
-    selection-background-color: #f0f0f2;
-    selection-color: #0a0a0a;
+    selection-background-color: {c.hover_bg};
+    selection-color: {c.text};
     outline: none;
     padding: 4px;
 }}
 
 QSpinBox {{
-    background-color: #ffffff;
-    border: 1px solid #dcdce0;
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 10px;
     padding: 6px 10px;
-    color: #0a0a0a;
+    color: {c.text};
 }}
 
 QCheckBox {{
-    color: #0a0a0a;
+    color: {c.text};
     font-size: 13px;
     spacing: 8px;
 }}
@@ -208,54 +272,54 @@ QCheckBox {{
 QCheckBox::indicator {{
     width: 16px;
     height: 16px;
-    border: 1px solid #b5b5b9;
+    border: 1px solid {c.text_faint};
     border-radius: 4px;
-    background-color: #ffffff;
+    background-color: {c.panel_bg};
 }}
 
 QCheckBox::indicator:checked {{
-    background-color: #0a0a0a;
-    border: 1px solid #0a0a0a;
+    background-color: {c.accent_bg};
+    border: 1px solid {c.accent_bg};
 }}
 
 QMenuBar {{
-    background-color: #ffffff;
-    color: #0a0a0a;
-    border-bottom: 1px solid #eeeeee;
+    background-color: {c.panel_bg};
+    color: {c.text};
+    border-bottom: 1px solid {c.border};
 }}
 
 QMenuBar::item {{
-    color: #0a0a0a;
+    color: {c.text};
     background: transparent;
 }}
 
 QMenuBar::item:selected {{
-    background-color: #f0f0f2;
+    background-color: {c.hover_bg};
     border-radius: 6px;
 }}
 
 QMenu {{
-    background-color: #ffffff;
-    border: 1px solid #e5e5e7;
+    background-color: {c.panel_bg};
+    border: 1px solid {c.border};
     border-radius: 8px;
-    color: #0a0a0a;
+    color: {c.text};
     padding: 4px;
 }}
 
 QMenu::item {{
-    color: #0a0a0a;
+    color: {c.text};
     padding: 6px 12px;
 }}
 
 QMenu::item:selected {{
-    background-color: #f0f0f2;
+    background-color: {c.hover_bg};
     border-radius: 6px;
 }}
 
 QToolTip {{
-    background-color: #ffffff;
-    color: #0a0a0a;
-    border: 1px solid #e5e5e7;
+    background-color: {c.panel_bg};
+    color: {c.text};
+    border: 1px solid {c.border};
     padding: 4px 8px;
     border-radius: 6px;
 }}
@@ -266,7 +330,7 @@ QScrollBar:vertical {{
 }}
 
 QScrollBar::handle:vertical {{
-    background: #d8d8db;
+    background: {c.border};
     border-radius: 5px;
     min-height: 30px;
 }}
@@ -275,3 +339,9 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
 }}
 """
+
+
+# Kept for backwards compatibility: the original module-level constant some
+# code may still import directly. Prefer build_stylesheet(dark=...) going
+# forward so the app can actually switch themes at runtime.
+STYLESHEET = build_stylesheet(dark=False)

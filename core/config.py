@@ -34,6 +34,8 @@ class ModelConfig:
     enabled: bool = True
     timeout_seconds: int = 60
     extra_headers: dict = field(default_factory=dict)
+    rpm_limit: Optional[int] = None  # requests/minute you want to self-cap at; None/0 = unlimited
+    rpd_limit: Optional[int] = None  # requests/day you want to self-cap at; None/0 = unlimited
 
 
 @dataclass
@@ -53,7 +55,7 @@ class ConfigManager:
 
     def load(self) -> AppConfig:
         if self.path.exists():
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
             models = [ModelConfig(**m) for m in raw.get("models", [])]
             self.config = AppConfig(
                 project_folder=raw.get("project_folder"),
@@ -70,7 +72,7 @@ class ConfigManager:
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = dataclasses.asdict(self.config)
-        self.path.write_text(json.dumps(data, indent=2))
+        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def sorted_models(self) -> List[ModelConfig]:
         """Enabled models, ordered by priority (ascending = tried first)."""

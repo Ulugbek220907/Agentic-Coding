@@ -97,6 +97,24 @@ class ModelEditDialog(QDialog):
         self.timeout_spin.setRange(5, 600)
         self.timeout_spin.setValue(model.timeout_seconds if model else 60)
 
+        self.rpm_spin = QSpinBox()
+        self.rpm_spin.setRange(0, 10000)
+        self.rpm_spin.setSpecialValueText("Unlimited")
+        default_rpm = (model.rpm_limit if model else None) or (preset.get("default_rpm_limit") if preset else None) or 0
+        self.rpm_spin.setValue(default_rpm)
+        self.rpm_spin.setToolTip(
+            "Requests per minute you want THIS APP to self-cap at for this "
+            "model. 0 = unlimited. Pre-filled from the preset's known free-tier "
+            "limit when available -- double check it matches your actual "
+            "account tier (limits vary by region/account age/billing status)."
+        )
+        self.rpd_spin = QSpinBox()
+        self.rpd_spin.setRange(0, 1000000)
+        self.rpd_spin.setSpecialValueText("Unlimited")
+        default_rpd = (model.rpd_limit if model else None) or (preset.get("default_rpd_limit") if preset else None) or 0
+        self.rpd_spin.setValue(default_rpd)
+        self.rpd_spin.setToolTip("Requests per day self-cap. 0 = unlimited. Pre-filled from the preset when known.")
+
         layout.addRow("Friendly name:", self.name_edit)
         layout.addRow("Provider type:", self.provider_combo)
         layout.addRow("Base URL:", self.base_url_edit)
@@ -104,6 +122,8 @@ class ModelEditDialog(QDialog):
         layout.addRow("Model ID:", self.model_id_edit)
         layout.addRow("Priority (0 = tried first):", self.priority_spin)
         layout.addRow("Timeout (seconds):", self.timeout_spin)
+        layout.addRow("RPM limit (self-imposed):", self.rpm_spin)
+        layout.addRow("RPD limit (self-imposed):", self.rpd_spin)
         layout.addRow("Enabled:", self.enabled_check)
 
         if preset:
@@ -150,6 +170,8 @@ class ModelEditDialog(QDialog):
             priority=self.priority_spin.value(),
             enabled=self.enabled_check.isChecked(),
             timeout_seconds=self.timeout_spin.value(),
+            rpm_limit=self.rpm_spin.value() or None,
+            rpd_limit=self.rpd_spin.value() or None,
         )
 
 

@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
 
 from ui.main_window import MainWindow
-from ui.theme import STYLESHEET, build_light_palette
+from ui.theme import build_stylesheet, build_palette
 
 
 def main():
@@ -15,7 +15,7 @@ def main():
     # widgets and fall back to the OS theme -- which, in Dark Mode, means
     # invisible white-on-white text in dropdowns and checkboxes.
     app.setStyle("Fusion")
-    app.setPalette(build_light_palette())
+    app.setPalette(build_palette(dark=False))
 
     font = QFont("Google Sans")
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
@@ -23,7 +23,7 @@ def main():
     font.setPointSize(10)
     app.setFont(font)
 
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(build_stylesheet(dark=False))
 
     window = MainWindow()
     window.show()

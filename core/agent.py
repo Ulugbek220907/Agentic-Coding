@@ -98,8 +98,8 @@ def run_agent_task(
                      project (see core/memory.py), folded into the system
                      prompt for continuity without replaying full history.
     """
-    tools = ProjectTools(project_root, confirm_write=confirm_write, confirm_command=confirm_command)
     stop_check = stop_check or (lambda: False)
+    tools = ProjectTools(project_root, confirm_write=confirm_write, confirm_command=confirm_command, stop_check=stop_check)
 
     history = [
         {"role": "system", "content": build_system_prompt(project_memory)},
