@@ -11,13 +11,15 @@ from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPlainTextEdit, Q
 from PyQt6.QtGui import QFont, QCloseEvent
 
 from ui.theme import ThemeColors
+from core import project_map
 
 
 class FileEditorDialog(QDialog):
-    def __init__(self, path: str, colors: ThemeColors, parent=None):
+    def __init__(self, path: str, colors: ThemeColors, project_root: str = None, parent=None):
         super().__init__(parent)
         self.path = Path(path)
         self.colors = colors
+        self._project_root = Path(project_root) if project_root else None
         self.setWindowTitle(f"Editing: {self.path.name}")
         self.resize(800, 600)
 
@@ -83,6 +85,18 @@ class FileEditorDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Save failed", f"Could not save '{self.path}':\n{e}")
             return
+        try:
+            # Find the project root by walking up until we hit a folder
+            # containing the map file OR just fall back to the file's own
+            # parent chain being unknown here -- simplest reliable approach:
+            # the caller (main_window) always opens files within the
+            # current project_folder, so update relative to that if we can
+            # determine it; otherwise skip silently.
+            if self._project_root:
+                rel = str(self.path.relative_to(self._project_root))
+                project_map.update_entry(str(self._project_root), rel)
+        except Exception:
+            pass  # map maintenance is a convenience, never worth failing the save over
         self._original_text = self.editor.toPlainText()
         self.save_btn.setEnabled(False)
         self.discard_btn.setEnabled(False)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import threading
 import uuid
@@ -10,10 +11,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTreeView,
     QTextEdit, QTextBrowser, QLineEdit, QPushButton, QFileDialog,
     QMessageBox, QLabel, QMenuBar, QComboBox, QSizePolicy, QApplication,
-    QMenu,
+    QMenu, QTabWidget, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl
-from PyQt6.QtGui import QAction, QFileSystemModel, QDesktopServices
+from PyQt6.QtGui import QAction, QFileSystemModel, QDesktopServices, QPixmap
 
 from core.config import ConfigManager
 from core.failover import ModelRouter
@@ -23,6 +24,9 @@ from core.memory import load_memory, append_memory
 from ui.settings_dialog import SettingsDialog
 from ui.theme import ThemeColors, build_palette, build_stylesheet
 from ui.file_editor_dialog import FileEditorDialog
+from core.skills import SkillManager
+from ui.skills_dialog import SkillsDialog
+from core import project_map
 
 def _summarize_tool_args(tool_name: str, arguments: dict) -> str:
     """
@@ -282,6 +286,39 @@ class TerminalWorker(QObject):
         self.finished.emit()
 
 
+class TeamWorker(QObject):
+    """Runs core.team.run_team_task on a background thread. Same
+    agent_event/finished/request_stop interface as AgentWorker/TerminalWorker."""
+    agent_event = pyqtSignal(dict)
+    finished = pyqtSignal()
+
+    def __init__(self, models, project_root, instruction, confirm_write, confirm_command, project_memory):
+        super().__init__()
+        self.models = models
+        self.project_root = project_root
+        self.instruction = instruction
+        self.confirm_write = confirm_write
+        self.confirm_command = confirm_command
+        self.project_memory = project_memory
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        from core.team import run_team_task
+        try:
+            for ev in run_team_task(
+                self.models, self.project_root, self.instruction,
+                confirm_write=self.confirm_write, confirm_command=self.confirm_command,
+                stop_check=lambda: self._stop_requested, project_memory=self.project_memory,
+            ):
+                self.agent_event.emit(ev)
+        except Exception as e:
+            self.agent_event.emit({"type": "error", "text": f"Unexpected error in Team mode: {e}"})
+        self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -371,6 +408,14 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
 
+        skills_action = QAction("Manage skills...", self)
+        skills_action.triggered.connect(self._open_skills_dialog)
+        file_menu.addAction(skills_action)
+
+    def _open_skills_dialog(self):
+        dlg = SkillsDialog(self)
+        dlg.exec()
+
     def _refresh_recent_menu(self):
         self.recent_menu.clear()
         recents = self.config.config.recent_projects
@@ -425,11 +470,17 @@ class MainWindow(QMainWindow):
             "text answer gets synthesized -- so cost stays close to N calls,\n"
             "not N calls per step plus extra arbitration.\n"
             "Max: same as Council but includes every enabled model. Most\n"
-            "thorough, most expensive -- use for high-stakes changes."
+            "thorough, most expensive -- use for high-stakes changes.\n"
+            "Team: splits the request into subtasks, assigns each to a "
+            "DIFFERENT model to run in parallel, then a reviewer model checks "
+            "each piece and reassigns anything that failed to a different "
+            "model. Needs 2+ enabled models. Best for larger requests that "
+            "genuinely split into independent pieces."
         )
         self.mode_combo.addItem("Light", CouncilMode.LIGHT)
         self.mode_combo.addItem("Council (2-3 AIs)", CouncilMode.COUNCIL)
         self.mode_combo.addItem("Max (all AIs)", CouncilMode.MAX)
+        self.mode_combo.addItem("Team (divide & conquer)", "team")
         self.mode_combo.setMinimumWidth(150)
         self.mode_combo.setFixedHeight(30)
         header_row.addWidget(self.mode_combo)
@@ -480,7 +531,30 @@ class MainWindow(QMainWindow):
         self.log.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         self.log.setOpenLinks(False)
         self.log.anchorClicked.connect(self._on_log_anchor_clicked)
-        right_layout.addWidget(self.log)
+
+        self.view_tabs = QTabWidget()
+
+        chat_tab = QWidget()
+        chat_tab_layout = QVBoxLayout(chat_tab)
+        chat_tab_layout.setContentsMargins(0, 0, 0, 0)
+        chat_tab_layout.addWidget(self.log)
+        self.view_tabs.addTab(chat_tab, "Chat")
+
+        visualize_tab = QWidget()
+        visualize_layout = QVBoxLayout(visualize_tab)
+        self.visualize_scroll = QScrollArea()
+        self.visualize_scroll.setWidgetResizable(True)
+        self.visualize_label = QLabel(
+            "No visualization yet.\nAsk the AI to plot/visualize something using "
+            "one of your enabled skills (Skills settings)."
+        )
+        self.visualize_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.visualize_label.setStyleSheet(f"color:{self._colors.text_faint};")
+        self.visualize_scroll.setWidget(self.visualize_label)
+        visualize_layout.addWidget(self.visualize_scroll)
+        self.view_tabs.addTab(visualize_tab, "Visualize")
+
+        right_layout.addWidget(self.view_tabs)
 
         input_row = QHBoxLayout()
         self.input_box = QLineEdit()
@@ -595,6 +669,17 @@ class MainWindow(QMainWindow):
         self.fs_model.setRootPath(folder)
         self.tree.setRootIndex(self.fs_model.index(folder))
         self.project_label.setText(f"Project: {folder}")
+        try:
+            # Index the codebase immediately on open (ast-parsing is fast,
+            # so this is a synchronous, near-instant pass) -- without this,
+            # a project that already existed before this feature, or one
+            # opened for the first time, would have an empty map until the
+            # agent happened to write_file something, and would fall back
+            # to the old "rediscover everything via list_dir/read_file"
+            # behavior for its first run in this window.
+            project_map.rebuild_full_map(folder)
+        except Exception:
+            pass  # indexing is a convenience; never block opening a project over it
 
     # ---------- File tree: open / edit ----------
 
@@ -625,7 +710,7 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
             return
-        dlg = FileEditorDialog(str(p), self._colors, parent=self)
+        dlg = FileEditorDialog(str(p), self._colors, project_root=self.project_folder, parent=self)
         dlg.exec()
 
     def _on_tree_context_menu(self, pos):
@@ -655,6 +740,33 @@ class MainWindow(QMainWindow):
             )
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _try_show_visualization(self, raw_result: str):
+        """A skill function returned something -- if it declared an
+        'output_file' pointing at an image, load it into the Visualize tab
+        and switch to it so the user actually sees what just got made."""
+        try:
+            parsed = json.loads(raw_result)
+        except Exception:
+            return
+        if not isinstance(parsed, dict):
+            return
+        output_file = parsed.get("output_file")
+        if not output_file:
+            return
+
+        path = Path(output_file)
+        if not path.is_absolute() and getattr(self, "project_folder", None):
+            path = Path(self.project_folder) / output_file
+        if not path.exists() or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
+            return  # not an image we can preview (e.g. an HTML chart) -- leave it to the file tree
+
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return
+        self.visualize_label.setPixmap(pixmap)
+        self.visualize_label.setStyleSheet("")
+        self.view_tabs.setCurrentIndex(1)
 
     # ---------- Settings ----------
 
@@ -831,6 +943,15 @@ class MainWindow(QMainWindow):
         ))
 
         mode = self.mode_combo.currentData() or CouncilMode.LIGHT
+
+        if mode == "team":
+            worker = TeamWorker(
+                models, self.project_folder, instruction,
+                self._confirm_write, self._confirm_command, self.project_memory,
+            )
+            self._start_worker(worker)
+            return
+
         router = CouncilRouter(models, mode=mode)
 
         worker = AgentWorker(
@@ -927,6 +1048,71 @@ class MainWindow(QMainWindow):
                     f"<span style='color:{c.error};font-size:11px;'>"
                     f"({html.escape(', '.join(ev['failed_models']))} didn't respond this round)</span>"
                 )
+        elif t == "plan_ready":
+            lines = [f"<b style='color:{c.text};'>Plan: {len(ev['subtasks'])} subtask(s)</b>"]
+            for st in ev["subtasks"]:
+                files = ", ".join(st["target_files"]) or "(no specific files)"
+                lines.append(
+                    f"&nbsp;&nbsp;<b>#{st['id']}</b> {html.escape(st['description'])} "
+                    f"<span style='color:{c.text_faint};font-size:11px;'>[{html.escape(files)}]</span>"
+                )
+            self._append_log(f"<div style='margin:10px 0;'>{'<br>'.join(lines)}</div>")
+        elif t == "subtask_assigned":
+            self._append_log(
+                f"<span style='color:{c.text_dim};font-size:12px;'>"
+                f"&nbsp;&nbsp;&#8594; Subtask #{ev['subtask_id']} assigned to <b>{html.escape(ev['model'])}</b></span>"
+            )
+        elif t == "subtask_event":
+            inner = ev["event"]
+            sid = ev["subtask_id"]
+            if inner["type"] == "assistant_text":
+                snippet = inner["text"][:150] + ("..." if len(inner["text"]) > 150 else "")
+                self._append_log(
+                    f"<span style='color:{c.text_faint};font-size:11px;'>"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;[#{sid}] {html.escape(snippet)}</span>"
+                )
+            elif inner["type"] == "tool_call":
+                self._append_log(
+                    f"<span style='color:{c.text_faint};font-family:Consolas,monospace;font-size:11px;'>"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;[#{sid}] &rarr; {html.escape(inner['name'])}"
+                    f"({html.escape(_summarize_tool_args(inner['name'], inner['arguments']))})</span>"
+                )
+            # tool_result/status/etc intentionally not rendered per-subtask to
+            # avoid drowning the log -- subtask_done below gives the summary.
+        elif t == "subtask_done":
+            self._append_log(
+                f"<span style='color:{c.text_dim};font-size:12px;'>"
+                f"&nbsp;&nbsp;&#10003; Subtask #{ev['subtask_id']} finished: {html.escape(str(ev['summary']))}</span>"
+            )
+        elif t == "review_result":
+            if ev["passed"]:
+                self._append_log(
+                    f"<span style='color:{c.success};font-size:12px;'>"
+                    f"&nbsp;&nbsp;&#9989; Subtask #{ev['subtask_id']} passed review: {html.escape(ev['reason'])}</span>"
+                )
+            else:
+                self._append_log(
+                    f"<span style='color:{c.error};font-size:12px;'>"
+                    f"&nbsp;&nbsp;&#10060; Subtask #{ev['subtask_id']} failed review: {html.escape(ev['reason'])}</span>"
+                )
+        elif t == "subtask_reassigned":
+            self._append_log(
+                f"<span style='color:{c.warning};font-size:12px;'>"
+                f"&nbsp;&nbsp;&#8635; Reassigning subtask #{ev['subtask_id']} to a different model "
+                f"(attempt {ev['attempt']})</span>"
+            )
+        elif t == "team_done":
+            lines = [f"<b style='color:{c.success};'>Team task finished</b>"]
+            for r in ev["results"]:
+                icon = {"passed": "&#9989;", "needs_manual_review": "&#9888;"}.get(r["status"], "&#8226;")
+                color = c.success if r["status"] == "passed" else c.warning
+                lines.append(
+                    f"&nbsp;&nbsp;<span style='color:{color};'>{icon} #{r['id']} {html.escape(r['description'])} "
+                    f"({html.escape(r['status'])}, {html.escape(str(r['assigned_model']))})</span>"
+                )
+            self._append_log(f"<div style='margin:10px 0;'>{'<br>'.join(lines)}</div>")
+            summary = "; ".join(f"#{r['id']} {r['status']}" for r in ev["results"])
+            self._remember(f"Team task: {summary}")
         elif t == "assistant_text":
             self._last_assistant_text = ev["text"]
             body = render_markdown_lite(ev["text"], self._code_blocks, c)
@@ -948,6 +1134,8 @@ class MainWindow(QMainWindow):
                 f"<span style='color:{c.text_faint};font-family:Consolas,monospace;font-size:12px;'>"
                 f"&nbsp;&nbsp;{html.escape(result_preview)}</span>"
             )
+            if str(ev.get("name", "")).startswith("skill__"):
+                self._try_show_visualization(ev["result"])
         elif t == "stopped":
             self._append_log(f"<b style='color:{c.warning};'>Stopped:</b> {html.escape(ev['text'])}")
             self._remember("(user stopped this task before it finished)")

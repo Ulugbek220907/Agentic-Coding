@@ -235,12 +235,40 @@ class SettingsDialog(QDialog):
         warn.setStyleSheet("color:#c22b2b; font-size:11px; font-weight:500;")
         layout.addWidget(warn)
 
+        divider2 = QFrame()
+        divider2.setFrameShape(QFrame.Shape.HLine)
+        divider2.setStyleSheet("color: #e5e5e7;")
+        layout.addWidget(divider2)
+
+        layout.addWidget(QLabel("Agent step limit"))
+        iter_row = QHBoxLayout()
+        self.max_iter_spin = QSpinBox()
+        self.max_iter_spin.setRange(0, 1000)
+        self.max_iter_spin.setSpecialValueText("No limit (stall detection only)")
+        self.max_iter_spin.setValue(self.config.config.max_agent_iterations)
+        self.max_iter_spin.setToolTip(
+            "Max tool-call steps per task. 0 = no fixed cap -- the agent runs "
+            "until done, genuinely stuck (same call repeated, or too long "
+            "with no real progress), or you hit Stop. Surgical edits "
+            "(read_symbol/edit_symbol) do less per step than a full-file "
+            "read/write did, so a low cap here can cut off legitimate work "
+            "on larger tasks."
+        )
+        self.max_iter_spin.valueChanged.connect(self._set_max_iterations)
+        iter_row.addWidget(self.max_iter_spin)
+        iter_row.addStretch()
+        layout.addLayout(iter_row)
+
         close_btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close_btn.rejected.connect(self.accept)
         close_btn.accepted.connect(self.accept)
         layout.addWidget(close_btn)
 
         self.refresh_table()
+
+    def _set_max_iterations(self, value: int):
+        self.config.config.max_agent_iterations = value
+        self.config.save()
 
     def _toggle_auto_write(self, checked: bool):
         self.config.config.auto_confirm_writes = checked

@@ -1,0 +1,22 @@
+{
+  "name": "plotting",
+  "display_name": "Math Function Plotter",
+  "version": "1.0",
+  "entry_file": "main.py",
+  "functions": [
+    {
+      "name": "plot_expressions",
+      "description": "Plot one or more math expressions of x over a range and save as a PNG chart.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expressions": {"type": "array", "items": {"type": "string"}, "description": "Python math expressions using 'x', e.g. 'sin(x) + log(x)'"},
+          "x_min": {"type": "number"},
+          "x_max": {"type": "number"},
+          "output_name": {"type": "string"}
+        },
+        "required": ["expressions"]
+      }
+    }
+  ]
+}

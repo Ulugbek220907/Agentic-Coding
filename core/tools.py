@@ -5,9 +5,12 @@ is rejected.
 """
 from __future__ import annotations
 
+import ast
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+from . import project_map
 
 
 _UNICODE_FONT_NAME = None  # cached after first successful registration
@@ -105,6 +108,141 @@ class ProjectTools:
         except Exception as e:
             return f"Error reading '{path}': {e}"
 
+    def read_file_range(self, path: str, start_line: int, end_line: int) -> str:
+        """Read only lines [start_line, end_line] (1-indexed, inclusive),
+        each prefixed with its line number -- for pulling just the part of
+        a large file you need, instead of the whole thing. Works on any
+        text file (not just Python)."""
+        target = self._resolve(path)
+        if not target.exists():
+            return f"Error: '{path}' does not exist."
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").split("\n")
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+        start = max(1, start_line)
+        end = min(len(lines), end_line)
+        if start > len(lines):
+            return f"Error: '{path}' only has {len(lines)} lines (requested start_line={start_line})."
+        snippet = "\n".join(f"{i}: {lines[i-1]}" for i in range(start, end + 1))
+        return snippet
+
+    def edit_file_lines(self, path: str, start_line: int, end_line: int, new_content: str) -> str:
+        """Replace lines [start_line, end_line] (1-indexed, inclusive) with
+        new_content, leaving the rest of the file untouched. Costs roughly
+        what the CHANGE is, not what the whole file is -- use this (or
+        edit_symbol, preferred for Python) instead of rewriting an entire
+        large file through write_file for a small change."""
+        target = self._resolve(path)
+        if not target.exists():
+            return f"Error: '{path}' does not exist."
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").split("\n")
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+        start = max(1, start_line)
+        end = min(len(lines), end_line)
+        if start > len(lines) + 1:
+            return f"Error: '{path}' only has {len(lines)} lines (requested start_line={start_line})."
+
+        preview = "\n".join(new_content.split("\n"))
+        if not self.confirm_write(str(target), f"[replace lines {start}-{end}]\n{preview}"):
+            return f"User declined editing '{path}'."
+
+        new_lines = lines[:start - 1] + new_content.split("\n") + lines[end:]
+        try:
+            target.write_text("\n".join(new_lines), encoding="utf-8")
+        except Exception as e:
+            return f"Error writing '{path}': {e}"
+        try:
+            project_map.update_entry(str(self.root), path)
+        except Exception:
+            pass
+        delta = len(new_lines) - len(lines)
+        return (
+            f"Replaced lines {start}-{end} in '{path}' ({len(new_lines)} lines now, "
+            f"{'+' if delta >= 0 else ''}{delta} vs before). "
+            f"NOTE: line numbers after line {start} have shifted by {delta} -- "
+            f"re-check the project map or re-read before further line-based edits to this file."
+        )
+
+    def read_symbol(self, path: str, symbol_name: str) -> str:
+        """Read just one class, function, or 'ClassName.method_name' from a
+        Python file -- not the whole file. Boundaries are re-resolved fresh
+        every call (never from a cached line number), so this stays correct
+        even after earlier edits changed the file's line count."""
+        target = self._resolve(path)
+        if not target.exists():
+            return f"Error: '{path}' does not exist."
+        try:
+            source = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+        loc = project_map.resolve_symbol(source, symbol_name)
+        if not loc:
+            return f"Error: could not find '{symbol_name}' in '{path}' (check exact name/casing, or use 'ClassName.method_name' for methods)."
+        lines = source.split("\n")
+        snippet = "\n".join(f"{i}: {lines[i-1]}" for i in range(loc["start_line"], loc["end_line"] + 1))
+        return snippet
+
+    def edit_symbol(self, path: str, symbol_name: str, new_code: str) -> str:
+        """Replace just one class, function, or 'ClassName.method_name' with
+        new_code, leaving the rest of the file untouched. new_code should
+        include correct indentation matching what read_symbol showed (for a
+        method, that means indented to sit inside its class -- if new_code's
+        first line has no leading whitespace, it will be auto-indented to
+        match). This is the preferred way to edit an existing Python file:
+        it costs roughly what the changed piece is, not what the whole file
+        is, which matters a lot on small-context free-tier models."""
+        target = self._resolve(path)
+        if not target.exists():
+            return f"Error: '{path}' does not exist."
+        try:
+            source = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+        loc = project_map.resolve_symbol(source, symbol_name)
+        if not loc:
+            return f"Error: could not find '{symbol_name}' in '{path}' (check exact name/casing, or use 'ClassName.method_name' for methods)."
+
+        lines = source.split("\n")
+        original_first_line = lines[loc["start_line"] - 1]
+        required_indent = original_first_line[: len(original_first_line) - len(original_first_line.lstrip())]
+
+        new_lines_in = new_code.split("\n")
+        first_new_indent = new_lines_in[0][: len(new_lines_in[0]) - len(new_lines_in[0].lstrip())] if new_lines_in[0].strip() else ""
+        if loc["kind"] == "method" and first_new_indent != required_indent and not first_new_indent:
+            # Model forgot the class-nesting indent -- auto-fix rather than
+            # silently producing a file that fails to parse.
+            new_lines_in = [f"{required_indent}{ln}" if ln.strip() else ln for ln in new_lines_in]
+
+        if not self.confirm_write(str(target), f"[replace {symbol_name}]\n" + "\n".join(new_lines_in)):
+            return f"User declined editing '{path}'."
+
+        new_lines = lines[:loc["start_line"] - 1] + new_lines_in + lines[loc["end_line"]:]
+        new_source = "\n".join(new_lines)
+
+        # Verify the result still parses before committing -- a bad edit_symbol
+        # call (wrong indent, unbalanced brackets, etc.) should surface as a
+        # clear error, not silently corrupt the file.
+        try:
+            ast.parse(new_source)
+        except SyntaxError as e:
+            return (
+                f"Edit NOT applied: the result would not be valid Python ({e}). "
+                f"Check indentation and syntax in new_code, then try again."
+            )
+
+        try:
+            target.write_text(new_source, encoding="utf-8")
+        except Exception as e:
+            return f"Error writing '{path}': {e}"
+        try:
+            project_map.update_entry(str(self.root), path)
+        except Exception:
+            pass
+        return f"Replaced '{symbol_name}' in '{path}'. Project map updated -- re-check it if you need this file's other symbols' current line numbers."
+
     def write_file(self, path: str, content: str) -> str:
         target = self._resolve(path)
         if not self.confirm_write(str(target), content):
@@ -121,6 +259,14 @@ class ProjectTools:
             # whole agent run -- the model gets to see what went wrong and
             # can retry (e.g. without the character that caused it).
             return f"Error writing '{path}': {e}"
+        try:
+            # Keep the project map in sync the instant a file changes --
+            # cheap static parsing, no extra AI call, so the NEXT message
+            # (or even the next step in this same run) already knows this
+            # file's classes/functions without needing to read_file it again.
+            project_map.update_entry(str(self.root), path)
+        except Exception:
+            pass  # map maintenance is a convenience, never worth failing the write over
         return f"Wrote {len(content)} characters to '{path}'."
 
     def generate_document(self, path: str, doc_type: str, title: str = "", sections: Optional[list] = None) -> str:
@@ -307,11 +453,92 @@ AGENT_TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read the full text content of a file relative to the project root.",
+        "description": (
+            "Read the FULL text content of a file relative to the project root. "
+            "For an EXISTING Python file that's already in the project map, "
+            "prefer read_symbol instead -- it costs far less and avoids "
+            "blowing past small free-tier request-size limits. Use read_file "
+            "for new/small files, or files read_symbol can't parse."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
+        },
+    },
+    {
+        "name": "read_file_range",
+        "description": "Read only lines [start_line, end_line] (1-indexed, inclusive) of a file, each prefixed with its line number. Works on any text file. Cheaper than read_file for a large file when you only need part of it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+            },
+            "required": ["path", "start_line", "end_line"],
+        },
+    },
+    {
+        "name": "edit_file_lines",
+        "description": (
+            "Replace lines [start_line, end_line] (1-indexed, inclusive) of a "
+            "file with new_content, leaving the rest of the file untouched. "
+            "Use for non-Python files, or Python edits that don't cleanly map "
+            "to one symbol. For Python, prefer edit_symbol when possible -- "
+            "it doesn't require you to track line numbers yourself. NOTE: "
+            "line numbers after your edit shift by however many lines you "
+            "added/removed -- re-check the project map before another "
+            "line-based edit to the same file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+                "new_content": {"type": "string", "description": "Replacement text for that line range (no line numbers, just the content)."},
+            },
+            "required": ["path", "start_line", "end_line", "new_content"],
+        },
+    },
+    {
+        "name": "read_symbol",
+        "description": (
+            "Read just ONE class, top-level function, or method ('ClassName.method_name') "
+            "from a Python file -- not the whole file. THIS IS THE PREFERRED WAY to look "
+            "at part of an existing large Python file: costs roughly what that piece is, "
+            "not what the whole file is. Boundaries are re-resolved fresh every call, so "
+            "it's always correct even after earlier edits to the file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "symbol_name": {"type": "string", "description": "e.g. 'MyClass', 'my_function', or 'MyClass.my_method'"},
+            },
+            "required": ["path", "symbol_name"],
+        },
+    },
+    {
+        "name": "edit_symbol",
+        "description": (
+            "Replace just ONE class, top-level function, or method ('ClassName.method_name') "
+            "with new_code, leaving the rest of the file untouched. THIS IS THE PREFERRED WAY "
+            "to edit an existing Python file: costs roughly what the CHANGE is, not the whole "
+            "file, which is essential on small-context free-tier models. Result is verified to "
+            "still be valid Python before being written -- a bad edit is rejected with a clear "
+            "error instead of corrupting the file. new_code should include the def/class line(s) "
+            "itself, with indentation matching what read_symbol showed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "symbol_name": {"type": "string", "description": "e.g. 'MyClass', 'my_function', or 'MyClass.my_method'"},
+                "new_code": {"type": "string", "description": "Full replacement source for that class/function/method, including its def/class line."},
+            },
+            "required": ["path", "symbol_name", "new_code"],
         },
     },
     {

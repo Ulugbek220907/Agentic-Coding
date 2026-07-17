@@ -43,7 +43,7 @@ class AppConfig:
     project_folder: Optional[str] = None
     recent_projects: List[str] = field(default_factory=list)  # most-recent-first, capped at 10
     models: List[ModelConfig] = field(default_factory=list)
-    max_agent_iterations: int = 25
+    max_agent_iterations: int = 60  # 0 = no fixed cap (stall detection + Stop button are the safety net instead)
     auto_confirm_writes: bool = False   # if False, UI will ask before writing files
     auto_confirm_commands: bool = False # if False, UI will ask before running shell commands
 
@@ -62,7 +62,7 @@ class ConfigManager:
                 project_folder=raw.get("project_folder"),
                 recent_projects=raw.get("recent_projects", []),
                 models=models,
-                max_agent_iterations=raw.get("max_agent_iterations", 25),
+                max_agent_iterations=raw.get("max_agent_iterations", 60),
                 auto_confirm_writes=raw.get("auto_confirm_writes", False),
                 auto_confirm_commands=raw.get("auto_confirm_commands", False),
             )

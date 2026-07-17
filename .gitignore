@@ -5,7 +5,9 @@
 
 # App config (may contain API keys / model settings)
 *.ai_agent_memory.json
+.ai_project_map.json
 config.json
+skills_trust.json
 
 # Python
 __pycache__/
