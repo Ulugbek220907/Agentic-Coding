@@ -22,7 +22,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 MAP_FILENAME = ".ai_project_map.json"
 
@@ -115,12 +115,27 @@ def save_map(project_root: str, map_data: dict):
     _map_path(project_root).write_text(json.dumps(map_data, indent=2), encoding="utf-8")
 
 
+DIR_KEY = "_directories"  # top-level key in the map JSON holding the full folder tree
+
+
+def _ensure_dirs_tracked(map_data: dict, rel_path: str):
+    """Register every parent directory of rel_path in the map's directory
+    list. Called after any write so newly created folders show up in the
+    tree immediately, not just after the next full rebuild."""
+    dirs = set(map_data.get(DIR_KEY, []))
+    parts = Path(rel_path).parts[:-1]  # drop the filename itself
+    for i in range(1, len(parts) + 1):
+        dirs.add(str(Path(*parts[:i])))
+    map_data[DIR_KEY] = sorted(dirs)
+
+
 def update_entry(project_root: str, rel_path: str):
     """Recompute the map entry for ONE file -- call this right after
     write_file succeeds. Cheap enough to do on every write with no
     noticeable delay."""
     map_data = load_map(project_root)
     map_data[rel_path] = describe_file(project_root, rel_path)
+    _ensure_dirs_tracked(map_data, rel_path)
     save_map(project_root, map_data)
 
 
@@ -132,24 +147,38 @@ def remove_entry(project_root: str, rel_path: str):
 
 
 def rebuild_full_map(project_root: str) -> dict:
-    """Walk the whole project and (re)build the map from scratch. Called
-    once when a project folder is opened, so even a project the agent
-    didn't build in this app still gets indexed instead of starting blank."""
+    """Walk the whole project and (re)build the map from scratch, indexing
+    BOTH files (with their parsed structure) AND the full directory tree --
+    including directories that are currently EMPTY. Without empty
+    directories being tracked, the model has no way to know "this folder
+    exists and has nothing in it yet" except by calling list_dir on it one
+    folder at a time, which is exactly the slow one-by-one exploration this
+    map exists to prevent. Called once when a project folder is opened, so
+    even a project the agent didn't build in this app still gets indexed
+    instead of starting blank."""
     root = Path(project_root)
-    map_data = {}
+    map_data: dict = {}
+    dirs = set()
     count = 0
     for f in sorted(root.rglob("*")):
-        if count >= MAX_FILES:
-            break
+        rel_parts = f.relative_to(root).parts
+        if any(part in SKIP_DIRS for part in rel_parts):
+            continue
+        if f.is_dir():
+            dirs.add(str(f.relative_to(root)))
+            continue
         if not f.is_file():
             continue
-        if any(part in SKIP_DIRS for part in f.relative_to(root).parts):
-            continue
         if f.name == MAP_FILENAME or f.name.startswith(".ai_"):
+            continue
+        for i in range(1, len(rel_parts)):
+            dirs.add(str(Path(*rel_parts[:i])))
+        if count >= MAX_FILES:
             continue
         rel = str(f.relative_to(root))
         map_data[rel] = describe_file(project_root, rel)
         count += 1
+    map_data[DIR_KEY] = sorted(dirs)
     save_map(project_root, map_data)
     return map_data
 
@@ -194,18 +223,74 @@ def _indent_of(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
+def _build_tree_lines(dirs: List[str], file_paths: List[str], max_lines: int = 300) -> List[str]:
+    """
+    Render a compact indented tree combining ALL directories (including
+    currently-empty ones) and files -- similar to what a `tree` command or
+    a PROJECT_STRUCTURE.txt would show. This is what lets the model see the
+    ENTIRE project skeleton (populated or not) in one shot from the system
+    prompt, instead of calling list_dir on every single folder one at a
+    time to discover "yep, this one's empty too."
+    """
+    root: dict = {}
+    for d in dirs:
+        node = root
+        for part in Path(d).parts:
+            node = node.setdefault(part, {})
+    for f in file_paths:
+        parts = Path(f).parts
+        node = root
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node.setdefault("__files__", []).append(parts[-1])
+
+    lines: List[str] = []
+
+    def _walk(node: dict, prefix: str):
+        if len(lines) >= max_lines:
+            return
+        subdirs = sorted(k for k in node if k != "__files__")
+        files = sorted(node.get("__files__", []))
+        for d in subdirs:
+            if len(lines) >= max_lines:
+                return
+            child = node[d]
+            child_has_content = bool(child)
+            lines.append(f"{prefix}{d}/" + ("" if child_has_content else "  (empty)"))
+            _walk(child, prefix + "  ")
+        for fname in files:
+            if len(lines) >= max_lines:
+                return
+            lines.append(f"{prefix}{fname}")
+
+    _walk(root, "")
+    if len(lines) >= max_lines:
+        lines.append(f"... (tree truncated at {max_lines} lines)")
+    return lines
+
+
 def render_for_prompt(map_data: dict, max_entries: int = 200) -> str:
-    """Compact, token-cheap text summary for the system prompt."""
+    """Compact, token-cheap text summary for the system prompt: a full
+    directory tree first (so the model sees the whole skeleton, including
+    empty folders, without exploring it), then per-file structure detail
+    for anything that has actual code in it."""
     if not map_data:
         return ""
-    lines = []
-    for rel_path, entry in list(map_data.items())[:max_entries]:
+
+    file_entries = {k: v for k, v in map_data.items() if k != DIR_KEY}
+    dirs = map_data.get(DIR_KEY, [])
+
+    tree_lines = _build_tree_lines(dirs, list(file_entries.keys()))
+
+    detail_lines = []
+    for rel_path, entry in list(file_entries.items())[:max_entries]:
         if entry.get("error"):
-            lines.append(f"{rel_path} ({entry['error']})")
             continue
+        if not entry.get("classes") and not entry.get("functions") and not entry.get("doc"):
+            continue  # nothing structural to say beyond what the tree already showed
         doc = entry.get("doc", "")
         header = f"{rel_path}" + (f" -- {doc}" if doc else "")
-        lines.append(header)
+        detail_lines.append(header)
         for cls in entry.get("classes", []):
             base_str = f"({', '.join(cls['bases'])})" if cls.get("bases") else ""
             cls_lines = cls.get("lines")
@@ -215,28 +300,38 @@ def render_for_prompt(map_data: dict, max_entries: int = 200) -> str:
                 for m in cls.get("methods", [])[:12]
             )
             doc_str = f" -- {cls['doc']}" if cls.get("doc") else ""
-            lines.append(f"  class {cls['name']}{base_str}{loc_str}: {method_str}{doc_str}")
+            detail_lines.append(f"  class {cls['name']}{base_str}{loc_str}: {method_str}{doc_str}")
         for fn in entry.get("functions", []):
             arg_str = ", ".join(fn.get("args", []))
             fn_lines = fn.get("lines")
             loc_str = f" [L{fn_lines[0]}-{fn_lines[1]}]" if fn_lines else ""
             doc_str = f" -- {fn['doc']}" if fn.get("doc") else ""
-            lines.append(f"  def {fn['name']}({arg_str}){loc_str}{doc_str}")
-    if not lines:
+            detail_lines.append(f"  def {fn['name']}({arg_str}){loc_str}{doc_str}")
+
+    if not tree_lines and not detail_lines:
         return ""
-    return (
-        "PROJECT MAP (existing files, classes, functions, and their line "
-        "ranges -- kept up to date automatically). You do NOT need to "
-        "list_dir or read_file just to see what already exists.\n\n"
-        "IMPORTANT -- for any EXISTING file shown here, prefer read_symbol/"
-        "edit_symbol over read_file/write_file: read_file/write_file "
-        "transfer the ENTIRE file every time, which is why large files blow "
-        "past small free-tier request-size limits (many free models cap "
-        "requests around 8000 tokens). read_symbol('path','ClassName') or "
-        "read_symbol('path','ClassName.method_name') fetches just that "
-        "piece; edit_symbol replaces just that piece and leaves the rest of "
-        "the file untouched -- both cost roughly what the piece is, not "
-        "what the whole file is. Only use read_file/write_file for files "
-        "that don't exist yet, or files small enough that it doesn't matter.\n\n"
-        + "\n".join(lines)
-    )
+
+    parts = [
+        "PROJECT MAP (kept up to date automatically -- this is the COMPLETE "
+        "project skeleton, including empty folders, plus the classes/"
+        "functions already written in existing files).\n\n"
+        "IMPORTANT: this map already shows every folder and file that "
+        "exists, including which folders are still EMPTY. Do NOT call "
+        "list_dir folder-by-folder to re-discover this -- it's all here. "
+        "Only call list_dir if you need to check something genuinely not "
+        "reflected in this map (e.g. right after a shell command that might "
+        "have created files outside this app's tracking).\n\n"
+        "For any EXISTING file with structure shown below, prefer "
+        "read_symbol/edit_symbol over read_file/write_file: read_file/"
+        "write_file transfer the ENTIRE file every time, which is why large "
+        "files blow past small free-tier request-size limits (many free "
+        "models cap requests around 8000 tokens). read_symbol('path',"
+        "'ClassName') or read_symbol('path','ClassName.method_name') "
+        "fetches just that piece; edit_symbol replaces just that piece and "
+        "leaves the rest of the file untouched.\n"
+    ]
+    if tree_lines:
+        parts.append("--- Directory tree ---\n" + "\n".join(tree_lines))
+    if detail_lines:
+        parts.append("--- File contents (classes/functions already written) ---\n" + "\n".join(detail_lines))
+    return "\n\n".join(parts)

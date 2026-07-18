@@ -110,6 +110,72 @@ def build_system_prompt(
     return prompt
 
 
+MAX_KEPT_RESULT_CHARS = 1500
+
+# Arguments that carry BULK content the model generated itself -- once the
+# paired tool_result confirms what happened, there is zero value in ever
+# resending this back to the model. This is the single biggest lever for
+# controlling context growth on multi-file tasks: a handful of 20-30KB
+# write_file calls in a row would otherwise each get replayed in full on
+# EVERY subsequent request for the rest of the task, compounding fast
+# enough to blow past small-model request-size limits (many free-tier
+# providers cap around 8000 tokens) within just a few steps, and to make
+# large-model requests slow enough to time out.
+CONTENT_ARG_KEYS = {
+    "write_file": ["content"],
+    "edit_file_lines": ["new_content"],
+    "edit_symbol": ["new_code"],
+    "generate_document": ["blocks", "sections"],
+}
+
+
+def _redact_tool_calls_for_history(tool_calls: list) -> list:
+    """Return a COPY of tool_calls with large content-bearing arguments
+    replaced by a short placeholder, for storage in conversation history.
+    The original (unredacted) tool_calls list -- fetched separately from
+    the raw model response -- is what's actually used to execute the
+    tools; this redacted copy is only ever what gets replayed back to a
+    model on future turns."""
+    redacted = []
+    for tc in tool_calls:
+        name = tc.get("name")
+        args = dict(tc.get("arguments") or {})
+        for key in CONTENT_ARG_KEYS.get(name, []):
+            if key in args and args[key]:
+                val = args[key]
+                val_str = val if isinstance(val, str) else json.dumps(val)
+                if len(val_str) > 200:
+                    args[key] = (
+                        f"[{len(val_str)} chars omitted from history -- already "
+                        f"written, see the paired tool_result for the outcome]"
+                    )
+        redacted.append({**tc, "arguments": args})
+    return redacted
+
+
+def _redact_stale_tool_results(history: list, protect_from_index: int):
+    """Shrink large tool_result entries from steps BEFORE the one that just
+    completed. Read-heavy tools (read_file, read_symbol, list_dir, etc.)
+    stay at full size for one extra step after they run -- in case the
+    model wants to immediately act on what it just read -- but don't need
+    to linger at full size forever once the conversation has moved on.
+    Idempotent (marks entries with _redacted so repeat passes are cheap)."""
+    for i, msg in enumerate(history):
+        if i >= protect_from_index:
+            continue
+        if msg.get("role") != "tool_result" or msg.get("_redacted"):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > MAX_KEPT_RESULT_CHARS:
+            omitted = len(content) - MAX_KEPT_RESULT_CHARS
+            msg["content"] = (
+                content[:MAX_KEPT_RESULT_CHARS]
+                + f"\n... [{omitted} more characters truncated from history -- "
+                  f"this was from an earlier step; re-read the file/symbol if you need the rest]"
+            )
+            msg["_redacted"] = True
+
+
 def run_agent_task(
     router: CouncilRouter,
     project_root: str,
@@ -167,6 +233,7 @@ def run_agent_task(
     NO_PROGRESS_STALL_THRESHOLD = 20  # this many steps with no successful mutating call -> stop
     recent_call_signatures: List[tuple] = []
     steps_since_progress = 0
+    protect_from_index = len(history)  # entries from the most recent step stay full-size; everything older gets shrunk
 
     i = 0
     while True:
@@ -181,6 +248,11 @@ def run_agent_task(
 
         step_label = f"step {i}" if not max_iterations else f"step {i}/{max_iterations}"
         yield {"type": "status", "text": f"Thinking ({step_label})..."}
+
+        # Shrink stale tool_results from steps before the last completed one
+        # -- see _redact_stale_tool_results docstring. Applied every
+        # iteration (cheap/idempotent) right before the request goes out.
+        _redact_stale_tool_results(history, protect_from_index)
 
         try:
             result = router.call(history, all_tools)
@@ -207,10 +279,14 @@ def run_agent_task(
             }
 
         response = result.response
+        step_start = len(history)  # this step's own entries begin here -- protected from redaction until NEXT step completes
         assistant_msg = {
             "role": "assistant",
             "content": response.get("content"),
-            "tool_calls": response.get("tool_calls") or [],
+            # Redacted copy for storage/replay -- see _redact_tool_calls_for_history.
+            # Execution below uses `tool_calls` fetched fresh from `response`,
+            # completely independent of this redacted copy.
+            "tool_calls": _redact_tool_calls_for_history(response.get("tool_calls") or []),
         }
         history.append(assistant_msg)
 
@@ -267,7 +343,10 @@ def run_agent_task(
                         args.get("path", ""),
                         args.get("doc_type", ""),
                         args.get("title", ""),
-                        args.get("sections", []),
+                        args.get("sections"),
+                        args.get("blocks"),
+                        args.get("subtitle", ""),
+                        args.get("author", ""),
                     )
                 elif skill_manager.is_skill_tool(name):
                     tool_output = skill_manager.call(name, args, project_root)
@@ -319,3 +398,5 @@ def run_agent_task(
         if task_finished:
             yield {"type": "done", "summary": finish_summary}
             return
+
+        protect_from_index = step_start  # this whole step (assistant msg + all its tool_results) stays full-size through the next iteration

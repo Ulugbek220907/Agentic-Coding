@@ -60,6 +60,100 @@ def _register_unicode_font() -> str:
     return _UNICODE_FONT_NAME
 
 
+_INLINE_TOKEN_RE = None  # lazily compiled, see _parse_inline()
+
+
+def _parse_inline(text: str) -> list:
+    """
+    Split text into (segment_text, {"bold":bool,"italic":bool,"code":bool})
+    runs based on simple **bold**, *italic*, `code` markers. Used by both
+    the docx and pdf writers so a model can write natural markdown-ish text
+    once and have it render as REAL bold/italic runs in both formats,
+    instead of everything coming out as flat unstyled text.
+    """
+    import re
+    global _INLINE_TOKEN_RE
+    if _INLINE_TOKEN_RE is None:
+        _INLINE_TOKEN_RE = re.compile(r"(\*\*.+?\*\*|\*.+?\*|`.+?`)")
+
+    segments = []
+    for token in _INLINE_TOKEN_RE.split(text):
+        if not token:
+            continue
+        if token.startswith("**") and token.endswith("**"):
+            segments.append((token[2:-2], {"bold": True, "italic": False, "code": False}))
+        elif token.startswith("*") and token.endswith("*"):
+            segments.append((token[1:-1], {"bold": False, "italic": True, "code": False}))
+        elif token.startswith("`") and token.endswith("`"):
+            segments.append((token[1:-1], {"bold": False, "italic": False, "code": True}))
+        else:
+            segments.append((token, {"bold": False, "italic": False, "code": False}))
+    return segments
+
+
+def _docx_add_inline_runs(paragraph, text: str):
+    for seg_text, style in _parse_inline(text):
+        run = paragraph.add_run(seg_text)
+        run.bold = style["bold"]
+        run.italic = style["italic"]
+        if style["code"]:
+            run.font.name = "Consolas"
+
+def _docx_shade_cell(cell, hex_color: str):
+    """python-docx has no high-level API for cell background shading --
+    this drops down to the underlying OOXML, which is the documented way
+    to do it."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    shading = OxmlElement("w:shd")
+    shading.set(qn("w:fill"), hex_color)
+    cell._tc.get_or_add_tcPr().append(shading)
+
+
+def _pdf_inline_to_markup(text: str) -> str:
+    """Convert our **bold**/*italic*/`code` markers to reportlab's Paragraph
+    mini-markup (a restricted HTML-like subset it natively understands)."""
+    import html as _html
+    parts = []
+    for seg_text, style in _parse_inline(text):
+        escaped = _html.escape(seg_text)
+        if style["bold"]:
+            escaped = f"<b>{escaped}</b>"
+        if style["italic"]:
+            escaped = f"<i>{escaped}</i>"
+        if style["code"]:
+            escaped = f"<font face='Courier'>{escaped}</font>"
+        parts.append(escaped)
+    return "".join(parts)
+
+
+def _normalize_blocks(sections: Optional[list], blocks: Optional[list]) -> list:
+    """Back-compat: if the caller used the old sections=[{heading,body}]
+    shape, convert it into the new blocks format so both code paths funnel
+    through one renderer."""
+    if blocks:
+        return blocks
+    out = []
+    for sec in sections or []:
+        if sec.get("heading"):
+            out.append({"type": "heading", "text": sec["heading"], "level": 1})
+        current_list = []
+        for line in sec.get("body", "").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("- "):
+                current_list.append(line[2:])
+            else:
+                if current_list:
+                    out.append({"type": "bullet_list", "items": current_list})
+                    current_list = []
+                out.append({"type": "paragraph", "text": line})
+        if current_list:
+            out.append({"type": "bullet_list", "items": current_list})
+    return out
+
+
 class ToolError(Exception):
     pass
 
@@ -269,87 +363,46 @@ class ProjectTools:
             pass  # map maintenance is a convenience, never worth failing the write over
         return f"Wrote {len(content)} characters to '{path}'."
 
-    def generate_document(self, path: str, doc_type: str, title: str = "", sections: Optional[list] = None) -> str:
+    def generate_document(
+        self, path: str, doc_type: str, title: str = "",
+        sections: Optional[list] = None, blocks: Optional[list] = None,
+        subtitle: str = "", author: str = "",
+    ) -> str:
         """
-        Create a real .docx, .pdf, or .xlsx file -- not a text dump. `sections`
-        is a list of {"heading": str, "body": str} dicts (body can contain
-        \\n-separated paragraphs; lines starting with "- " become bullets).
-        For .xlsx, `sections` is instead a list of rows (each row a list of
-        cell values), and `title` is used as the sheet name.
+        Create a real .docx, .pdf, or .xlsx file with professional
+        formatting -- headings, styled tables, inline bold/italic, bullet
+        and numbered lists, images, and page breaks.
+
+        `blocks` (preferred) is a list of dicts, each with a "type":
+          {"type": "heading", "text": "...", "level": 1-4}
+          {"type": "paragraph", "text": "supports **bold**, *italic*, `code`"}
+          {"type": "bullet_list", "items": ["...", "..."]}
+          {"type": "numbered_list", "items": ["...", "..."]}
+          {"type": "table", "headers": ["Col A","Col B"], "rows": [["1","2"]],
+           "col_widths": [2.0, 3.0]}   # optional, inches
+          {"type": "image", "path": "chart.png", "width_inches": 5.5}
+          {"type": "page_break"}
+          {"type": "spacer"}
+
+        `sections` (old shape, still accepted) is auto-converted to blocks.
+
+        For .xlsx: `blocks`/`sections` can be a list of {"sheet_name":str,
+        "headers":[...], "rows":[[...],...]} for one or more styled sheets,
+        OR the old plain list-of-rows shape for a single unstyled sheet.
         """
         target = self._resolve(path)
         if not self.confirm_write(str(target), f"[generated {doc_type} document: {title}]"):
             return f"User declined creating '{path}'."
-        sections = sections or []
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             doc_type = doc_type.lower().lstrip(".")
 
             if doc_type == "docx":
-                from docx import Document
-                doc = Document()
-                if title:
-                    doc.add_heading(title, level=0)
-                for sec in sections:
-                    if sec.get("heading"):
-                        doc.add_heading(sec["heading"], level=1)
-                    for line in sec.get("body", "").split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("- "):
-                            doc.add_paragraph(line[2:], style="List Bullet")
-                        else:
-                            doc.add_paragraph(line)
-                doc.save(str(target))
-
+                self._generate_docx(target, title, subtitle, author, _normalize_blocks(sections, blocks))
             elif doc_type == "pdf":
-                from reportlab.lib.pagesizes import letter
-                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
-                from reportlab.lib.styles import getSampleStyleSheet
-
-                font_name = _register_unicode_font()
-                bold_font = f"{font_name}-Bold" if font_name != "Helvetica" else "Helvetica-Bold"
-
-                styles = getSampleStyleSheet()
-                for style_name in ("Title", "Heading2", "Normal"):
-                    styles[style_name].fontName = (
-                        bold_font if style_name in ("Title", "Heading2") else font_name
-                    )
-
-                story = []
-                if title:
-                    story.append(Paragraph(title, styles["Title"]))
-                    story.append(Spacer(1, 12))
-                for sec in sections:
-                    if sec.get("heading"):
-                        story.append(Paragraph(sec["heading"], styles["Heading2"]))
-                    bullets = []
-                    for line in sec.get("body", "").split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("- "):
-                            bullets.append(ListItem(Paragraph(line[2:], styles["Normal"])))
-                        else:
-                            if bullets:
-                                story.append(ListFlowable(bullets, bulletType="bullet"))
-                                bullets = []
-                            story.append(Paragraph(line, styles["Normal"]))
-                    if bullets:
-                        story.append(ListFlowable(bullets, bulletType="bullet"))
-                    story.append(Spacer(1, 10))
-                SimpleDocTemplate(str(target), pagesize=letter).build(story)
-
+                self._generate_pdf(target, title, subtitle, author, _normalize_blocks(sections, blocks))
             elif doc_type == "xlsx":
-                from openpyxl import Workbook
-                wb = Workbook()
-                ws = wb.active
-                ws.title = (title or "Sheet1")[:31]
-                for row in sections:
-                    ws.append(row)
-                wb.save(str(target))
-
+                self._generate_xlsx(target, title, sections or blocks or [])
             else:
                 return f"Unsupported doc_type '{doc_type}'. Use 'docx', 'pdf', or 'xlsx'."
 
@@ -362,6 +415,264 @@ class ProjectTools:
             return f"Error generating '{path}': {e}"
 
         return f"Created {doc_type} document at '{path}'."
+
+    def _generate_docx(self, target, title, subtitle, author, blocks):
+        from docx import Document
+        from docx.shared import Inches, Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        doc = Document()
+        if author:
+            doc.core_properties.author = author
+        if title:
+            doc.core_properties.title = title
+
+        if title:
+            h = doc.add_heading(title, level=0)
+        if subtitle:
+            sub = doc.add_paragraph(subtitle)
+            sub.style = doc.styles["Subtitle"] if "Subtitle" in [s.name for s in doc.styles] else sub.style
+            for run in sub.runs:
+                run.italic = True
+                run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+
+        for block in blocks:
+            btype = block.get("type")
+            if btype == "heading":
+                doc.add_heading(block.get("text", ""), level=min(max(block.get("level", 1), 1), 4))
+            elif btype == "paragraph":
+                p = doc.add_paragraph()
+                _docx_add_inline_runs(p, block.get("text", ""))
+            elif btype == "bullet_list":
+                for item in block.get("items", []):
+                    p = doc.add_paragraph(style="List Bullet")
+                    _docx_add_inline_runs(p, item)
+            elif btype == "numbered_list":
+                for item in block.get("items", []):
+                    p = doc.add_paragraph(style="List Number")
+                    _docx_add_inline_runs(p, item)
+            elif btype == "table":
+                headers = block.get("headers", [])
+                rows = block.get("rows", [])
+                col_widths = block.get("col_widths")
+                if not headers and not rows:
+                    continue
+                n_cols = len(headers) if headers else (len(rows[0]) if rows else 0)
+                if n_cols == 0:
+                    continue
+                table = doc.add_table(rows=0, cols=n_cols)
+                table.style = "Table Grid"
+                if headers:
+                    row_cells = table.add_row().cells
+                    for i, h_text in enumerate(headers):
+                        row_cells[i].text = ""
+                        p = row_cells[i].paragraphs[0]
+                        run = p.add_run(str(h_text))
+                        run.bold = True
+                        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                        _docx_shade_cell(row_cells[i], "2F5597")  # professional dark blue header
+                for r_idx, row in enumerate(rows):
+                    row_cells = table.add_row().cells
+                    for i, cell_val in enumerate(row):
+                        if i >= n_cols:
+                            break
+                        row_cells[i].text = ""
+                        p = row_cells[i].paragraphs[0]
+                        _docx_add_inline_runs(p, str(cell_val))
+                        if r_idx % 2 == 1:
+                            _docx_shade_cell(row_cells[i], "F2F2F2")  # subtle zebra striping
+                if col_widths:
+                    for i, w in enumerate(col_widths):
+                        if i < n_cols:
+                            for row in table.rows:
+                                row.cells[i].width = Inches(w)
+                doc.add_paragraph()  # breathing room after a table
+            elif btype == "image":
+                img_path = self._resolve(block.get("path", ""))
+                if img_path.exists():
+                    width = block.get("width_inches")
+                    doc.add_picture(str(img_path), width=Inches(width) if width else None)
+                else:
+                    doc.add_paragraph(f"[image not found: {block.get('path')}]")
+            elif btype == "page_break":
+                doc.add_page_break()
+            elif btype == "spacer":
+                doc.add_paragraph()
+
+        doc.save(str(target))
+
+    def _generate_pdf(self, target, title, subtitle, author, blocks):
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem,
+            Table, TableStyle, Image, PageBreak,
+        )
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        font_name = _register_unicode_font()
+        bold_font = f"{font_name}-Bold" if font_name != "Helvetica" else "Helvetica-Bold"
+
+        styles = getSampleStyleSheet()
+        for style_name in ("Title", "Heading1", "Heading2", "Heading3", "Heading4", "Normal"):
+            if style_name in styles.byName:
+                is_heading = style_name.startswith("Heading") or style_name == "Title"
+                styles[style_name].fontName = bold_font if is_heading else font_name
+
+        story = []
+        if title:
+            story.append(Paragraph(title, styles["Title"]))
+        if subtitle:
+            sub_style = styles["Normal"].clone("Subtitle")
+            sub_style.textColor = colors.HexColor("#606060")
+            sub_style.fontSize = 12
+            story.append(Paragraph(subtitle, sub_style))
+        if title or subtitle:
+            story.append(Spacer(1, 16))
+
+        heading_style_for_level = {1: "Heading1", 2: "Heading2", 3: "Heading3", 4: "Heading4"}
+
+        for block in blocks:
+            btype = block.get("type")
+            if btype == "heading":
+                level = min(max(block.get("level", 1), 1), 4)
+                story.append(Paragraph(_pdf_inline_to_markup(block.get("text", "")), styles[heading_style_for_level[level]]))
+                story.append(Spacer(1, 6))
+            elif btype == "paragraph":
+                story.append(Paragraph(_pdf_inline_to_markup(block.get("text", "")), styles["Normal"]))
+                story.append(Spacer(1, 6))
+            elif btype == "bullet_list":
+                items = [ListItem(Paragraph(_pdf_inline_to_markup(i), styles["Normal"])) for i in block.get("items", [])]
+                story.append(ListFlowable(items, bulletType="bullet"))
+                story.append(Spacer(1, 8))
+            elif btype == "numbered_list":
+                items = [ListItem(Paragraph(_pdf_inline_to_markup(i), styles["Normal"])) for i in block.get("items", [])]
+                story.append(ListFlowable(items, bulletType="1"))
+                story.append(Spacer(1, 8))
+            elif btype == "table":
+                headers = block.get("headers", [])
+                rows = block.get("rows", [])
+                if not headers and not rows:
+                    continue
+                # Wrap every cell in a Paragraph (not a bare string) so long
+                # text actually WRAPS instead of overflowing the column --
+                # this is a common reportlab gotcha with plain-string Table data.
+                cell_style = styles["Normal"].clone("TableCell")
+                cell_style.fontSize = 9
+                header_style = cell_style.clone("TableHeader")
+                header_style.textColor = colors.white
+                header_style.fontName = bold_font
+
+                table_data = []
+                if headers:
+                    table_data.append([Paragraph(_pdf_inline_to_markup(str(h)), header_style) for h in headers])
+                for row in rows:
+                    table_data.append([Paragraph(_pdf_inline_to_markup(str(c)), cell_style) for c in row])
+
+                col_widths = block.get("col_widths")
+                col_widths_pt = [w * inch for w in col_widths] if col_widths else None
+
+                t = Table(table_data, colWidths=col_widths_pt, repeatRows=1 if headers else 0)
+                style_cmds = [
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]
+                if headers:
+                    style_cmds.append(("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F5597")))
+                    data_start = 1
+                else:
+                    data_start = 0
+                # Zebra striping on data rows for readability.
+                for i in range(data_start, len(table_data)):
+                    if (i - data_start) % 2 == 1:
+                        style_cmds.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#F2F2F2")))
+                t.setStyle(TableStyle(style_cmds))
+                story.append(t)
+                story.append(Spacer(1, 12))
+            elif btype == "image":
+                img_path = self._resolve(block.get("path", ""))
+                if img_path.exists():
+                    width = block.get("width_inches", 5.0) * inch
+                    story.append(Image(str(img_path), width=width, height=None, kind="proportional"))
+                    story.append(Spacer(1, 10))
+                else:
+                    story.append(Paragraph(f"[image not found: {block.get('path')}]", styles["Normal"]))
+            elif btype == "page_break":
+                story.append(PageBreak())
+            elif btype == "spacer":
+                story.append(Spacer(1, 12))
+
+        def _add_page_number(canvas, doc):
+            canvas.saveState()
+            canvas.setFont(font_name, 8)
+            canvas.setFillColor(colors.HexColor("#888888"))
+            canvas.drawRightString(letter[0] - 0.6 * inch, 0.4 * inch, f"Page {doc.page}")
+            canvas.restoreState()
+
+        doc = SimpleDocTemplate(
+            str(target), pagesize=letter,
+            leftMargin=0.9 * inch, rightMargin=0.9 * inch,
+            topMargin=0.8 * inch, bottomMargin=0.8 * inch,
+            title=title or "", author=author or "",
+        )
+        doc.build(story, onFirstPage=_add_page_number, onLaterPages=_add_page_number)
+
+    def _generate_xlsx(self, target, title, sheets):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+        wb = Workbook()
+        wb.remove(wb.active)  # replace default sheet with our own explicitly-named ones
+
+        # Accept either the new multi-sheet shape or the old flat list-of-rows shape.
+        if sheets and isinstance(sheets[0], dict) and ("rows" in sheets[0] or "headers" in sheets[0]):
+            sheet_specs = sheets
+        else:
+            sheet_specs = [{"sheet_name": title or "Sheet1", "headers": [], "rows": sheets}]
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+        zebra_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        thin = Side(style="thin", color="CCCCCC")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for spec in sheet_specs:
+            ws = wb.create_sheet(title=(spec.get("sheet_name") or "Sheet1")[:31])
+            headers = spec.get("headers", [])
+            rows = spec.get("rows", [])
+
+            if headers:
+                ws.append(headers)
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = border
+
+            for r_idx, row in enumerate(rows):
+                ws.append(row)
+                if headers:  # only zebra-stripe/border rows when there's a real header to anchor against
+                    excel_row = r_idx + 2
+                    for cell in ws[excel_row]:
+                        cell.border = border
+                        if r_idx % 2 == 1:
+                            cell.fill = zebra_fill
+
+            # Auto-size columns based on content length (openpyxl has no
+            # built-in autofit, this is the standard workaround).
+            for col_cells in ws.columns:
+                length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+                ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 50)
+
+            if headers:
+                ws.freeze_panes = "A2"
+
+        wb.save(str(target))
 
     def _kill_process_tree(self, proc: "subprocess.Popen"):
         import sys, signal, os
@@ -565,12 +876,27 @@ AGENT_TOOLS = [
     {
         "name": "generate_document",
         "description": (
-            "Create a REAL .docx, .pdf, or .xlsx file (not a text file). Use this "
-            "whenever the user asks for a Word doc, PDF, report, or spreadsheet -- "
-            "never try to fake one with write_file. For docx/pdf, 'sections' is a "
-            "list of {heading, body} objects (body lines starting with '- ' become "
-            "bullet points). For xlsx, 'sections' is a list of rows, each row a "
-            "list of cell values, and the first row is typically your header."
+            "Create a REAL, professionally formatted .docx, .pdf, or .xlsx file "
+            "(not a text file). Use this whenever the user asks for a Word doc, "
+            "PDF, report, or spreadsheet -- never fake one with write_file.\n\n"
+            "For docx/pdf, use 'blocks': a list of typed objects rendered in order:\n"
+            '  {"type":"heading","text":"...","level":1-4}\n'
+            '  {"type":"paragraph","text":"supports **bold**, *italic*, `code`"}\n'
+            '  {"type":"bullet_list","items":["...","..."]}\n'
+            '  {"type":"numbered_list","items":["...","..."]}\n'
+            '  {"type":"table","headers":["Col A","Col B"],"rows":[["1","2"]],"col_widths":[2.0,3.0]}\n'
+            '  {"type":"image","path":"chart.png","width_inches":5.5}\n'
+            '  {"type":"page_break"}\n'
+            '  {"type":"spacer"}\n'
+            "Tables get real styled headers, borders, and zebra-striped rows -- "
+            "always use a table block for any tabular/comparison data instead of "
+            "faking a table with dashes or pipes in a paragraph.\n\n"
+            "For xlsx, 'blocks' is a list of one or more sheets: "
+            '[{"sheet_name":"Sheet1","headers":[...],"rows":[[...],...]}, ...] -- '
+            "each becomes its own styled sheet with a bold header row and auto-sized columns.\n\n"
+            "'sections' (legacy: list of {heading, body}) is still accepted but "
+            "'blocks' should be preferred for anything needing a table, image, or "
+            "precise formatting."
         ),
         "parameters": {
             "type": "object",
@@ -578,7 +904,10 @@ AGENT_TOOLS = [
                 "path": {"type": "string", "description": "Output path, e.g. 'reports/summary.pdf'"},
                 "doc_type": {"type": "string", "enum": ["docx", "pdf", "xlsx"]},
                 "title": {"type": "string"},
-                "sections": {"type": "array", "items": {"type": "object"}},
+                "subtitle": {"type": "string", "description": "Optional, shown under the title (docx/pdf only)."},
+                "author": {"type": "string", "description": "Optional document metadata author (docx/pdf only)."},
+                "blocks": {"type": "array", "items": {"type": "object"}, "description": "Preferred. See description for block types."},
+                "sections": {"type": "array", "items": {"type": "object"}, "description": "Legacy alternative to blocks: list of {heading, body}."},
             },
             "required": ["path", "doc_type"],
         },
