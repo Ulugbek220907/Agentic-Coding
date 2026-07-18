@@ -99,6 +99,7 @@ class CouncilRouter:
         mode: CouncilMode = CouncilMode.LIGHT,
         on_event: Optional[Callable[[str, dict], None]] = None,
         max_workers: int = 6,
+        shared_routers: Optional[Dict[str, ModelRouter]] = None,
     ):
         self.all_models = all_models
         self.mode = mode
@@ -106,7 +107,13 @@ class CouncilRouter:
         self.max_workers = max_workers
         # One ModelRouter per participant so each individual model still
         # benefits from its own failover/cooldown bookkeeping across turns.
-        self._sub_routers: Dict[str, ModelRouter] = {}
+        # If shared_routers is passed in (e.g. from Team mode, which
+        # constructs a fresh CouncilRouter for every subtask/review call),
+        # that cooldown/backoff state is shared across ALL of those calls
+        # instead of being thrown away and rebuilt from scratch every time
+        # -- without this, a broken/deprecated model gets retried with zero
+        # memory of its previous failure on every single call.
+        self._sub_routers: Dict[str, ModelRouter] = shared_routers if shared_routers is not None else {}
 
     def _router_for(self, model: ModelConfig) -> ModelRouter:
         if model.name not in self._sub_routers:
